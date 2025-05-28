@@ -106,12 +106,12 @@ fn http_read_file(path: &CStr, ring: &mut IoUring, stream: &mut KtlsStream<TcpSt
     let cqe = ring.completion().next().expect("completion queue is empty");
 
     println!("{:?}", cqe);
-    unsafe {
-        println!("{:?}", statx.assume_init().stx_size);
-    }
+    let file_size = unsafe { statx.assume_init().stx_size };
+    println!("{:?}", file_size);
 
     // ********************************************
-    let content_len = cqe.result();
+    let content_len = file_size;
+    println!("content length = {}", content_len);
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
 Content-Type: text/plain; charset=UTF-8\r\n\
