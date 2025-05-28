@@ -1,5 +1,6 @@
 use io_uring::{IoUring, opcode, types};
 use ktls::{CorkStream, KtlsStream, config_ktls_server};
+use libc::{AT_FDCWD, STATX_SIZE, statx};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::Acceptor;
@@ -7,11 +8,14 @@ use rustls::{ServerConfig, ServerConnection};
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{BufReader, Read, Write, pipe, stdout};
+use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::{fs, io};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+
+extern crate libc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -56,14 +60,6 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
 
                     handle_client(&mut tls_stream);
 
-                    // Write HTTP response asynchronously
-                    if let Err(e) = tls_stream.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nHello\r\n\r\n"
-                    ).await {
-                        eprintln!("Failed to write response: {}", e);
-                        return;
-                    }
-
                     // Flush and shutdown TLS session properly
                     if let Err(e) = tls_stream.shutdown().await {
                         eprintln!("Failed to shutdown TLS stream: {}", e);
@@ -80,7 +76,76 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
 fn handle_client(stream: &mut KtlsStream<TcpStream>) -> io::Result<()> {
     let mut ring = IoUring::new(8)?;
 
-    let fd = fs::File::open("README.md")?;
+    // let fd = fs::File::open("README.md")?;
+    http_read_file(c"./README.md", &mut ring, stream);
+
+    Ok(())
+}
+
+// let path = c"./README.md";
+fn http_read_file(path: &CStr, ring: &mut IoUring, stream: &mut KtlsStream<TcpStream>) {
+    let str_path = path.to_str().unwrap();
+    let statx: MaybeUninit<statx> = MaybeUninit::uninit();
+
+    let statx_e = opcode::Statx::new(
+        types::Fd(AT_FDCWD),
+        path.as_ptr(),
+        statx.as_ptr().cast_mut().cast(),
+    )
+    .mask(STATX_SIZE)
+    .build()
+    .user_data(13);
+    unsafe {
+        ring.submission()
+            .push(&statx_e)
+            .expect("submission queue is full");
+    }
+
+    ring.submit_and_wait(1).expect("err");
+
+    let cqe = ring.completion().next().expect("completion queue is empty");
+
+    println!("{:?}", cqe);
+    unsafe {
+        println!("{:?}", statx.assume_init().stx_size);
+    }
+
+    // ********************************************
+    let content_len = cqe.result();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+Content-Type: text/plain; charset=UTF-8\r\n\
+Content-Length: {length}\r\n\
+Content-Disposition: inline; filename=\"{filename}\"\r\n\
+Cache-Control: no-cache\r\n\
+Server: FastFileServer/1.0\r\n\
+\r\n",
+        length = content_len,
+        filename = str_path,
+    );
+
+    let send_e = opcode::Send::new(
+        types::Fd(stream.as_raw_fd()),
+        response.as_ptr(),
+        response.len() as u32,
+    )
+    .build()
+    .user_data(7);
+    unsafe {
+        ring.submission()
+            .push(&send_e)
+            .expect("submission queue is full");
+    }
+
+    ring.submit_and_wait(1).expect("err");
+
+    let cqe = ring.completion().next().expect("completion queue is empty");
+
+    println!("{:?}", cqe);
+
+    // ********************************************
+
+    let fd = fs::File::open(path.to_str().unwrap()).expect("err");
     let (p_reader, p_writer) = pipe().expect("cound not create pipe");
 
     let splice_read_e = opcode::Splice::new(
@@ -98,7 +163,7 @@ fn handle_client(stream: &mut KtlsStream<TcpStream>) -> io::Result<()> {
             .expect("submission queue is full");
     }
 
-    ring.submit_and_wait(1)?;
+    ring.submit_and_wait(1).expect("err");
 
     let cqe = ring.completion().next().expect("completion queue is empty");
 
@@ -119,10 +184,9 @@ fn handle_client(stream: &mut KtlsStream<TcpStream>) -> io::Result<()> {
             .expect("submission queue is full");
     }
 
-    ring.submit_and_wait(1)?;
+    ring.submit_and_wait(1).expect("err");
 
     let cqe = ring.completion().next().expect("completion queue is empty");
 
     println!("{:?}", cqe);
-    Ok(())
 }

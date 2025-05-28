@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 io-uring = "0.7.7"
 ktls = "6.0.2"
+libc = "0.2.172"
 rustls = "0.23.27"
 tokio = { version = "1.45.1", features = ["net", "rt"] }
 tokio-rustls = "0.26.2"
