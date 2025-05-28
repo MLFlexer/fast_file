@@ -39,7 +39,7 @@ fn handle_client(stream: TcpStream) -> io::Result<()> {
     let splice_write_e = opcode::Splice::new(
         types::Fd(p_reader.as_raw_fd()),
         -1,
-        types::Fd(stdout().as_raw_fd()),
+        types::Fd(stream.as_raw_fd()),
         -1,
         1024,
     )
