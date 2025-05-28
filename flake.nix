@@ -19,7 +19,7 @@
       in {
         devShells.default = with pkgs;
           mkShell {
-            buildInputs = with pkgs; [ rust_nightly bacon ];
+            buildInputs = with pkgs; [ openssl rust_nightly bacon ];
 
             env = { };
           };
