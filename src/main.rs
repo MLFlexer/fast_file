@@ -1,5 +1,5 @@
 use io_uring::{IoUring, opcode, types};
-use ktls::{CorkStream, config_ktls_server};
+use ktls::{CorkStream, KtlsStream, config_ktls_server};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::Acceptor;
@@ -54,6 +54,8 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
 
                     let mut tls_stream = config_ktls_server(tls_stream).await.unwrap();
 
+                    handle_client(&mut tls_stream);
+
                     // Write HTTP response asynchronously
                     if let Err(e) = tls_stream.write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nHello\r\n\r\n"
@@ -73,4 +75,54 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
             }
         });
     }
+}
+
+fn handle_client(stream: &mut KtlsStream<TcpStream>) -> io::Result<()> {
+    let mut ring = IoUring::new(8)?;
+
+    let fd = fs::File::open("README.md")?;
+    let (p_reader, p_writer) = pipe().expect("cound not create pipe");
+
+    let splice_read_e = opcode::Splice::new(
+        types::Fd(fd.as_raw_fd()),
+        0,
+        types::Fd(p_writer.as_raw_fd()),
+        -1,
+        1024,
+    )
+    .build()
+    .user_data(42);
+    unsafe {
+        ring.submission()
+            .push(&splice_read_e)
+            .expect("submission queue is full");
+    }
+
+    ring.submit_and_wait(1)?;
+
+    let cqe = ring.completion().next().expect("completion queue is empty");
+
+    println!("{:?}", cqe);
+
+    let splice_write_e = opcode::Splice::new(
+        types::Fd(p_reader.as_raw_fd()),
+        -1,
+        types::Fd(stream.as_raw_fd()),
+        -1,
+        1024,
+    )
+    .build()
+    .user_data(69);
+    unsafe {
+        ring.submission()
+            .push(&splice_write_e)
+            .expect("submission queue is full");
+    }
+
+    ring.submit_and_wait(1)?;
+
+    let cqe = ring.completion().next().expect("completion queue is empty");
+
+    println!("{:?}", cqe);
+    Ok(())
 }
