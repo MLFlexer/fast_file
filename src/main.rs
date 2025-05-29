@@ -27,12 +27,16 @@ extern crate libc;
 
 static PIPE_DEFAULT_SIZE: OnceLock<u32> = OnceLock::new();
 
-fn set_pipe_size(fd: i32) -> u32 {
-    let size = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+fn set_pipe_size(fd1: i32, fd2: i32) -> u32 {
+    let size = unsafe { libc::fcntl(fd1, libc::F_GETPIPE_SZ) };
+    let size2 = unsafe { libc::fcntl(fd2, libc::F_GETPIPE_SZ) };
     if size == -1 {
         panic!("COULD NOT GET SIZE OF PIPE!");
     }
-    return size as u32;
+    if size2 == -1 {
+        panic!("COULD NOT GET SIZE OF PIPE!");
+    }
+    return size.min(size2) as u32;
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -334,9 +338,10 @@ Server: FastFileServer/1.0\r\n\
 
     // submit enough requests to send the whole file.
     // WARNING: This can overflow the io_uring submission queue.
-    for offset in (0..=file_size)
-        .step_by(*PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_w.as_raw_fd())) as usize)
-    {
+    for offset in (0..=file_size).step_by(
+        *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()))
+            as usize,
+    ) {
         let remaining = file_size.saturating_sub(offset);
         let len = remaining.min(*PIPE_DEFAULT_SIZE.get().unwrap() as u64) as u32;
         info!("{}", offset);
