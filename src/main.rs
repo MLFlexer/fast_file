@@ -199,7 +199,21 @@ async fn handle_client(stream: &mut KtlsStream<TcpStream>) -> io::Result<()> {
     Ok(())
 }
 
-// let path = c"./README.md";
+fn set_blocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let new_flags = flags & !libc::O_NONBLOCK;
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 fn http_read_file(
     file: FileToServe,
     ring: &mut IoUring,
@@ -215,6 +229,9 @@ fn http_read_file(
 
     let (fd, file_size) = get_fd_and_size(ring, statx_ptr)?;
     info!("fd: {:?}, file_size: {}", fd, file_size);
+
+    set_blocking(pipe_r.as_raw_fd());
+    set_blocking(pipe_w.as_raw_fd());
 
     write_response_and_close(ring, stream, fd, file_size, &file, pipe_r, pipe_w)
 }
@@ -304,36 +321,7 @@ fn write_response_and_close(
     pipe_w: &mut PipeWriter,
 ) -> Result<(), ReadFileErr> {
     let mut n_submissions = 0;
-    // TODO: maybe switch to http2 for concurrent requests
-    let path = &file.path;
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-Content-Type: {content_type}\r\n\
-Content-Length: {length}\r\n\
-Content-Disposition: inline; filename=\"{filename}\"\r\n\
-Cache-Control: no-cache\r\n\
-Connection: keep-alive\r\n\
-Server: FastFileServer/1.0\r\n\
-\r\n",
-        content_type = file.get_http_content_type(),
-        length = file_size,
-        filename = path.to_str().unwrap(),
-    );
-
-    info!("{}", response);
-
-    let send_e = opcode::Send::new(
-        types::Fd(stream.as_raw_fd()),
-        response.as_ptr(),
-        response.len() as u32,
-    )
-    .build()
-    .flags(Flags::IO_LINK);
-
-    if let Err(e) = unsafe { ring.submission().push(&send_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
-    }
+    let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
     n_submissions += 1;
 
     // submit enough requests to send the whole file.
@@ -344,63 +332,118 @@ Server: FastFileServer/1.0\r\n\
     ) {
         let remaining = file_size.saturating_sub(offset);
         let len = remaining.min(*PIPE_DEFAULT_SIZE.get().unwrap() as u64) as u32;
-        let mut flags = 0;
-        if remaining <= len as u64 {
-            flags |= SPLICE_F_MORE;
-        }
         info!("offset: {}, remaining: {}, len: {}", offset, remaining, len);
-        let splice_read_e =
-            opcode::Splice::new(fd, offset as i64, types::Fd(pipe_w.as_raw_fd()), -1, len)
-                .flags(flags)
-                .build()
-                .flags(Flags::IO_LINK);
-
-        if let Err(e) = unsafe { ring.submission().push(&splice_read_e) } {
-            error!("Submission error: {e}");
-            return Err(ReadFileErr::FailedPush);
-        }
-        n_submissions += 1;
-
-        let splice_write_e = opcode::Splice::new(
-            types::Fd(pipe_r.as_raw_fd()),
-            -1,
+        spliced_read_write(
+            ring,
+            fd,
             types::Fd(stream.as_raw_fd()),
-            -1,
+            pipe_r,
+            pipe_w,
+            offset as i64,
             len,
-        )
-        .flags(flags)
-        .build()
-        .flags(Flags::IO_LINK);
-
-        if let Err(e) = unsafe { ring.submission().push(&splice_write_e) } {
-            error!("Submission error: {e}");
-            return Err(ReadFileErr::FailedPush);
-        }
-        n_submissions += 1;
+        )?;
+        n_submissions += 2;
     }
 
     // Closing
-
-    let close_e = opcode::Close::new(fd).build().user_data(420);
-
-    if let Err(e) = unsafe { ring.submission().push(&close_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
-    }
+    close_file(ring, fd)?;
     n_submissions += 1;
 
     if let Err(e) = ring.submit_and_wait(n_submissions) {
         return Err(ReadFileErr::Submission);
     };
 
-    // TODO: is this correct?
     for _ in 0..n_submissions {
         let Some(cqe) = ring.completion().next() else {
             return Err(ReadFileErr::NoSubmission);
         };
         info!("cqe: {:?}", cqe);
     }
-    info!("COMPLETED SEND OF {:?}!", path);
+    info!("COMPLETED SEND OF {:?}!", file.path);
 
+    drop(header_buffer);
     Ok(())
+}
+
+fn spliced_read_write(
+    ring: &mut IoUring,
+    fd_read: types::Fd,
+    fd_write: types::Fd,
+    pipe_r: &mut PipeReader,
+    pipe_w: &mut PipeWriter,
+    offset: i64,
+    len: u32,
+) -> Result<(), ReadFileErr> {
+    let splice_read_e = opcode::Splice::new(
+        fd_read,
+        offset as i64,
+        types::Fd(pipe_w.as_raw_fd()),
+        -1,
+        len,
+    )
+    // .flags(flags)
+    .build()
+    .flags(Flags::IO_LINK);
+
+    if let Err(e) = unsafe { ring.submission().push(&splice_read_e) } {
+        error!("Submission error: {e}");
+        return Err(ReadFileErr::FailedPush);
+    }
+
+    let splice_write_e = opcode::Splice::new(types::Fd(pipe_r.as_raw_fd()), -1, fd_write, -1, len)
+        // .flags(flags)
+        .build()
+        .flags(Flags::IO_LINK);
+
+    if let Err(e) = unsafe { ring.submission().push(&splice_write_e) } {
+        error!("Submission error: {e}");
+        return Err(ReadFileErr::FailedPush);
+    }
+    return Ok(());
+}
+
+fn close_file(ring: &mut IoUring, fd: types::Fd) -> Result<(), ReadFileErr> {
+    let close_e = opcode::Close::new(fd).build().user_data(420);
+
+    if let Err(e) = unsafe { ring.submission().push(&close_e) } {
+        error!("Submission error: {e}");
+        return Err(ReadFileErr::FailedPush);
+    }
+    return Ok(());
+}
+
+fn send_header(
+    ring: &mut IoUring,
+    fd: types::Fd,
+    file: &FileToServe,
+    length: StatxSize,
+) -> Result<String, ReadFileErr> {
+    // TODO: maybe switch to http2 for concurrent requests
+    let path = &file.path;
+    let response_buffer = format!(
+        "HTTP/1.1 200 OK\r\n\
+Content-Type: {content_type}\r\n\
+Content-Length: {length}\r\n\
+Content-Disposition: inline; filename=\"{filename}\"\r\n\
+Cache-Control: no-cache\r\n\
+Connection: keep-alive\r\n\
+Server: FastFileServer/1.0\r\n\
+\r\n",
+        content_type = file.get_http_content_type(),
+        length = length,
+        filename = path.to_str().unwrap(),
+    );
+
+    info!("{}", response_buffer);
+
+    let send_e = opcode::Send::new(fd, response_buffer.as_ptr(), response_buffer.len() as u32)
+        .build()
+        .flags(Flags::IO_LINK);
+
+    if let Err(e) = unsafe { ring.submission().push(&send_e) } {
+        error!("Submission error: {e}");
+        return Err(ReadFileErr::FailedPush);
+    }
+    // WARNING: don't drop the buffer before completion of the send
+    return Ok(response_buffer);
 }
