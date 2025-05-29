@@ -328,29 +328,26 @@ fn write_response_and_close(
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
     let mut submitted = 1;
 
-    let mut offsets: Vec<(u32, u32)> =
-        Vec::with_capacity(file_size.div_ceil(pipe_size as u64) as usize);
+    let mut offsets: Vec<(u32, u32)> = Vec::with_capacity(total_submissions as usize);
 
-    for (i, offset) in (0..file_size + pipe_size as u64)
+    for (idx, offset) in (0..file_size + pipe_size as u64)
         .step_by(pipe_size)
         .enumerate()
     {
         let remaining = file_size.saturating_sub(offset);
         let len = remaining.min(pipe_size as u64) as u32;
-        offsets.push((offset as u32, len));
-        let idx = i as u64 * 2;
         // submit enough requests to send the whole file.
         // WARNING: This can overflow the io_uring submission queue.
-        spliced_read_write(
+        spliced_read(ring, fd, pipe_w, offset as i64, len, idx as u64)?;
+        offsets.push((offset as u32, len));
+        spliced_write(
             ring,
-            fd,
             types::Fd(stream.as_raw_fd()),
             pipe_r,
-            pipe_w,
-            offset as i64,
             len,
-            (idx, idx + 1),
+            idx as u64 + 1,
         )?;
+        offsets.push((offset as u32, len));
     }
     close_file(ring, fd)?;
 
@@ -375,6 +372,7 @@ fn write_response_and_close(
         for _ in 0..submitted {
             let cqe = ring.completion().next().unwrap();
             info!("{:?}", cqe);
+
             match cqe.user_data() {
                 i if i == u64::MAX => {
                     // open
@@ -388,28 +386,28 @@ fn write_response_and_close(
                 }
                 idx if idx % 2 == 0 => {
                     // read splice
-                    // do nothing?
+                    if cqe.result() < 0 {
+                        let (offset, len) = offsets[idx as usize];
+                        spliced_read(ring, fd, pipe_w, offset as i64, len, idx as u64)?;
+                    }
                 }
                 idx if idx % 2 == 1 => {
                     // write splice
                     if cqe.result() < 0 {
-                        let (offset, len) = offsets[idx as usize / 2];
-                        spliced_read_write(
+                        let (_, len) = offsets[idx as usize];
+                        spliced_write(
                             ring,
-                            fd,
                             types::Fd(stream.as_raw_fd()),
                             pipe_r,
-                            pipe_w,
-                            offset as i64,
                             len,
-                            (idx - 1, idx),
+                            idx as u64 + 1,
                         )?;
 
                         if let None = failed_idx {
-                            submitted = 2;
-                            failed_idx = Some(idx / 2);
+                            submitted = 1;
+                            failed_idx = Some(idx);
                         } else {
-                            submitted += 2;
+                            submitted += 1;
                         }
                     } else {
                     }
@@ -552,15 +550,13 @@ fn write_response_and_close(
     Ok(())
 }
 
-fn spliced_read_write(
+fn spliced_read(
     ring: &mut IoUring,
     fd_read: types::Fd,
-    fd_write: types::Fd,
-    pipe_r: &mut PipeReader,
     pipe_w: &mut PipeWriter,
     offset: i64,
     len: u32,
-    (read_id, write_id): (u64, u64),
+    read_id: u64,
 ) -> Result<(), ReadFileErr> {
     let splice_read_e = opcode::Splice::new(
         fd_read,
@@ -579,6 +575,16 @@ fn spliced_read_write(
         return Err(ReadFileErr::FailedPush);
     }
 
+    return Ok(());
+}
+
+fn spliced_write(
+    ring: &mut IoUring,
+    fd_write: types::Fd,
+    pipe_r: &mut PipeReader,
+    len: u32,
+    write_id: u64,
+) -> Result<(), ReadFileErr> {
     let splice_write_e = opcode::Splice::new(types::Fd(pipe_r.as_raw_fd()), -1, fd_write, -1, len)
         // .flags(flags)
         .build()
@@ -591,6 +597,46 @@ fn spliced_read_write(
     }
     return Ok(());
 }
+
+// fn spliced_read_write(
+//     ring: &mut IoUring,
+//     fd_read: types::Fd,
+//     fd_write: types::Fd,
+//     pipe_r: &mut PipeReader,
+//     pipe_w: &mut PipeWriter,
+//     offset: i64,
+//     len: u32,
+//     (read_id, write_id): (u64, u64),
+// ) -> Result<(), ReadFileErr> {
+//     let splice_read_e = opcode::Splice::new(
+//         fd_read,
+//         offset as i64,
+//         types::Fd(pipe_w.as_raw_fd()),
+//         -1,
+//         len,
+//     )
+//     // .flags(flags)
+//     .build()
+//     .user_data(read_id)
+//     .flags(Flags::IO_LINK);
+
+//     if let Err(e) = unsafe { ring.submission().push(&splice_read_e) } {
+//         error!("Submission error: {e}");
+//         return Err(ReadFileErr::FailedPush);
+//     }
+
+//     let splice_write_e = opcode::Splice::new(types::Fd(pipe_r.as_raw_fd()), -1, fd_write, -1, len)
+//         // .flags(flags)
+//         .build()
+//         .user_data(write_id)
+//         .flags(Flags::IO_LINK);
+
+//     if let Err(e) = unsafe { ring.submission().push(&splice_write_e) } {
+//         error!("Submission error: {e}");
+//         return Err(ReadFileErr::FailedPush);
+//     }
+//     return Ok(());
+// }
 
 fn close_file(ring: &mut IoUring, fd: types::Fd) -> Result<(), ReadFileErr> {
     let close_e = opcode::Close::new(fd).build().user_data(u64::MAX - 1);
