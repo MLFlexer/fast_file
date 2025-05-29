@@ -344,7 +344,7 @@ Server: FastFileServer/1.0\r\n\
     ) {
         let remaining = file_size.saturating_sub(offset);
         let len = remaining.min(*PIPE_DEFAULT_SIZE.get().unwrap() as u64) as u32;
-        info!("{}", offset);
+        info!("offset: {}, remaining: {}, len: {}", offset, remaining, len);
         let splice_read_e =
             opcode::Splice::new(fd, offset as i64, types::Fd(pipe_w.as_raw_fd()), -1, len)
                 .build()
