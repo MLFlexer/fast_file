@@ -1,7 +1,7 @@
 use io_uring::squeue::Flags;
 use io_uring::{IoUring, opcode, types};
 use ktls::{CorkStream, KtlsStream, config_ktls_server};
-use libc::{AT_FDCWD, O_RDONLY, SPLICE_F_MORE, STATX_SIZE, statx};
+use libc::{AT_FDCWD, EAGAIN, O_RDONLY, SPLICE_F_MORE, STATX_SIZE, statx};
 use log::{error, info};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -199,21 +199,6 @@ async fn handle_client(stream: &mut KtlsStream<TcpStream>) -> io::Result<()> {
     Ok(())
 }
 
-fn set_blocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let new_flags = flags & !libc::O_NONBLOCK;
-    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) };
-    if ret == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(())
-}
-
 fn http_read_file(
     file: FileToServe,
     ring: &mut IoUring,
@@ -229,9 +214,6 @@ fn http_read_file(
 
     let (fd, file_size) = get_fd_and_size(ring, statx_ptr)?;
     info!("fd: {:?}, file_size: {}", fd, file_size);
-
-    set_blocking(pipe_r.as_raw_fd());
-    set_blocking(pipe_w.as_raw_fd());
 
     write_response_and_close(ring, stream, fd, file_size, &file, pipe_r, pipe_w)
 }
@@ -320,45 +302,61 @@ fn write_response_and_close(
     pipe_r: &mut PipeReader,
     pipe_w: &mut PipeWriter,
 ) -> Result<(), ReadFileErr> {
-    let mut n_submissions = 0;
+    let pipe_size = *PIPE_DEFAULT_SIZE
+        .get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()))
+        as usize;
+    const NUM_HEADER_SUBMISSIONS: u64 = 1;
+    const NUM_CLOSE_SUBMISSIONS: u64 = 1;
+    let num_splice_submissions = file_size.div_ceil(pipe_size as u64) * 2;
+    let total_submissions = NUM_HEADER_SUBMISSIONS + num_splice_submissions + NUM_CLOSE_SUBMISSIONS;
+    let mut submissions_completed = 0;
+
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
-    n_submissions += 1;
 
-    // submit enough requests to send the whole file.
-    // WARNING: This can overflow the io_uring submission queue.
-    for offset in (0..=file_size).step_by(
-        *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()))
-            as usize,
-    ) {
-        let remaining = file_size.saturating_sub(offset);
-        let len = remaining.min(*PIPE_DEFAULT_SIZE.get().unwrap() as u64) as u32;
-        info!("offset: {}, remaining: {}, len: {}", offset, remaining, len);
-        spliced_read_write(
-            ring,
-            fd,
-            types::Fd(stream.as_raw_fd()),
-            pipe_r,
-            pipe_w,
-            offset as i64,
-            len,
-        )?;
-        n_submissions += 2;
-    }
+    let mut starting_offset = 0;
+    while submissions_completed < total_submissions {
+        // submit enough requests to send the whole file.
+        // WARNING: This can overflow the io_uring submission queue.
+        for offset in (starting_offset..=file_size).step_by(pipe_size) {
+            let remaining = file_size.saturating_sub(offset);
+            let len = remaining.min(pipe_size as u64) as u32;
+            info!("offset: {}, remaining: {}, len: {}", offset, remaining, len);
+            spliced_read_write(
+                ring,
+                fd,
+                types::Fd(stream.as_raw_fd()),
+                pipe_r,
+                pipe_w,
+                offset as i64,
+                len,
+            )?;
+        }
 
-    // Closing
-    close_file(ring, fd)?;
-    n_submissions += 1;
+        // Closing
+        close_file(ring, fd)?;
 
-    if let Err(e) = ring.submit_and_wait(n_submissions) {
-        return Err(ReadFileErr::Submission);
-    };
-
-    for _ in 0..n_submissions {
-        let Some(cqe) = ring.completion().next() else {
-            return Err(ReadFileErr::NoSubmission);
+        if let Err(e) = ring.submit_and_wait((total_submissions - submissions_completed) as usize) {
+            return Err(ReadFileErr::Submission);
         };
-        info!("cqe: {:?}", cqe);
+        for _ in submissions_completed..=total_submissions {
+            let Some(cqe) = ring.completion().next() else {
+                return Err(ReadFileErr::NoSubmission);
+            };
+            info!("cqe: {:?}", cqe);
+            match cqe.result() {
+                EAGAIN => break,
+                i if i < 0 => todo!(),
+                _i if submissions_completed == 1 => {
+                    submissions_completed += 1;
+                }
+                i => {
+                    starting_offset += i as u64;
+                    submissions_completed += 1;
+                }
+            }
+        }
     }
+
     info!("COMPLETED SEND OF {:?}!", file.path);
 
     drop(header_buffer);
