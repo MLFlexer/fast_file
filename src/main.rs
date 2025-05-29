@@ -1,7 +1,7 @@
 use io_uring::squeue::Flags;
 use io_uring::{IoUring, opcode, types};
 use ktls::{CorkStream, KtlsStream, config_ktls_server};
-use libc::{AT_FDCWD, O_RDONLY, STATX_SIZE, statx};
+use libc::{AT_FDCWD, O_RDONLY, SPLICE_F_MORE, STATX_SIZE, statx};
 use log::{error, info};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -344,9 +344,14 @@ Server: FastFileServer/1.0\r\n\
     ) {
         let remaining = file_size.saturating_sub(offset);
         let len = remaining.min(*PIPE_DEFAULT_SIZE.get().unwrap() as u64) as u32;
+        let mut flags = 0;
+        if remaining <= len as u64 {
+            flags |= SPLICE_F_MORE;
+        }
         info!("offset: {}, remaining: {}, len: {}", offset, remaining, len);
         let splice_read_e =
             opcode::Splice::new(fd, offset as i64, types::Fd(pipe_w.as_raw_fd()), -1, len)
+                .flags(flags)
                 .build()
                 .flags(Flags::IO_LINK);
 
@@ -363,6 +368,7 @@ Server: FastFileServer/1.0\r\n\
             -1,
             len,
         )
+        .flags(flags)
         .build()
         .flags(Flags::IO_LINK);
 
