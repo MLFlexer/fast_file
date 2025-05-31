@@ -31,12 +31,15 @@ fn set_pipe_size(fd1: i32, fd2: i32) -> u32 {
     if size2 == -1 {
         panic!("COULD NOT GET SIZE OF PIPE!");
     }
-    return (size.min(size2)).min(81920) as u32;
+    return (size.min(size2)).min(16384) as u32;
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    SimpleLogger::new().init().unwrap();
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
     let conf = tls_config();
     let _ = tcp_listener(conf).await;
 }
@@ -76,31 +79,75 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
 
                     let mut ktls_stream = config_ktls_server(tls_stream).await.unwrap();
 
-                    let one: libc::c_int = 1;
-                    unsafe {
-                        libc::setsockopt(
-                            ktls_stream.as_raw_fd(),
-                            libc::SOL_TCP,
-                            libc::TCP_CORK,
-                            &one as *const _ as *const _,
-                            std::mem::size_of_val(&one) as _,
-                        );
-                    }
-                    handle_client(&mut ktls_stream).await.expect("ERROR");
-                    let one: libc::c_int = 0;
-                    unsafe {
-                        libc::setsockopt(
-                            ktls_stream.as_raw_fd(),
-                            libc::SOL_TCP,
-                            libc::TCP_CORK,
-                            &one as *const _ as *const _,
-                            std::mem::size_of_val(&one) as _,
-                        );
-                    }
+                    let (drained, mut stream) = ktls_stream.into_raw();
+                    let drained = drained.unwrap_or_default();
+
+                    info!("{} bytes already decoded by rustls", drained.len());
+
+                    // let one: libc::c_int = 1;
+                    // unsafe {
+                    //     libc::setsockopt(
+                    //         ktls_stream.as_raw_fd(),
+                    //         libc::SOL_TCP,
+                    //         libc::TCP_CORK,
+                    //         &one as *const _ as *const _,
+                    //         std::mem::size_of_val(&one) as _,
+                    //     );
+                    // }
+                    handle_client(&mut stream, &drained).await.expect("ERROR");
+                    info!("FINISHED SENDING FILE!");
+                    let x = stream.flush().await;
+                    info!("FINISHED flushing {:?}!", x);
+
+                    let x = stream.shutdown().await;
+
+                    info!("SHUTDOWN!, {:?}", x);
+                    // let one: libc::c_int = 0;
+                    // unsafe {
+                    //     libc::setsockopt(
+                    //         ktls_stream.as_raw_fd(),
+                    //         libc::SOL_TCP,
+                    //         libc::TCP_CORK,
+                    //         &one as *const _ as *const _,
+                    //         std::mem::size_of_val(&one) as _,
+                    //     );
+                    // }
 
                     // Flush and shutdown TLS session properly
-                    ktls_stream.flush().await.expect("Could not flush");
-                    ktls_stream.shutdown().await.expect("Could not shutdown");
+                    // ktls_stream.flush().await.expect("Could not flush");
+                    // ktls_stream.shutdown().await.expect("Could not shutdown");
+                    // let mut retries = 3;
+                    // while retries > 0 {
+                    //     info!("FLUSHING!");
+                    //     match ktls_stream.flush().await {
+                    //         Ok(_) => break,
+                    //         Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    //             retries -= 1;
+                    //             use tokio::time::{Duration, sleep};
+                    //             sleep(Duration::from_millis(100)).await;
+                    //         }
+                    //         Err(e) => {
+                    //             eprintln!("Flush failed permanently: {}", e);
+                    //             break;
+                    //         }
+                    //     }
+                    // }
+                    // let mut retries = 3;
+                    // while retries > 0 {
+                    //     info!("SHUTDOWN!");
+                    //     match ktls_stream.shutdown().await {
+                    //         Ok(_) => break,
+                    //         Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    //             retries -= 1;
+                    //             use tokio::time::{Duration, sleep};
+                    //             sleep(Duration::from_millis(100)).await;
+                    //         }
+                    //         Err(e) => {
+                    //             eprintln!("shutdown failed permanently: {}", e);
+                    //             break;
+                    //         }
+                    //     }
+                    // }
                 }
                 Err(e) => {
                     error!("TLS handshake failed: {}", e);
@@ -176,22 +223,28 @@ impl FileToServe {
     }
 }
 
-async fn handle_client(stream: &mut KtlsStream<TcpStream>) -> io::Result<()> {
-    let mut dst: [u8; 1024] = [0; 1024];
-    let n_bytes = stream.read(&mut dst).await.expect("err");
-    info!("{:?}", String::from_utf8(dst.to_vec()));
-    info!("{}", n_bytes);
+async fn handle_client(stream: &mut TcpStream, drained: &Vec<u8>) -> io::Result<()> {
+    // let mut dst: [u8; 1024] = [0; 1024];
+    // let n_bytes = stream.read(&mut dst).await.expect("err");
+    // info!("{:?}", String::from_utf8(dst.to_vec()));
+    // info!("{}", n_bytes);
+    info!("http raw req: {:?}", String::from_utf8(drained.to_vec()));
 
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
-    let _res = req.parse(&dst).expect("err").unwrap();
+    // let _res = req.parse(&dst).expect("err").unwrap();
+    let _res = req.parse(&drained).expect("err").unwrap();
 
     // TODO: should be some fixed size and be able to handle large files.
-    let mut ring = IoUring::new(128)?;
+    let mut ring = IoUring::new(1024)?;
     match req.path {
         None => return Ok(()),
         Some("/") => {
             let (mut p_reader, mut p_writer) = pipe().expect("cound not create pipe");
+
+            set_nonblocking(p_reader.as_raw_fd())?;
+            set_nonblocking(p_writer.as_raw_fd())?;
+
             let file = FileToServe::from_str("/index.html").expect("err");
             http_read_file(file, &mut ring, stream, &mut p_reader, &mut p_writer).expect("err");
             if let Err(e) = stream.flush().await {
@@ -213,10 +266,23 @@ async fn handle_client(stream: &mut KtlsStream<TcpStream>) -> io::Result<()> {
     Ok(())
 }
 
+fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 fn http_read_file(
     file: FileToServe,
     ring: &mut IoUring,
-    stream: &mut KtlsStream<TcpStream>,
+    stream: &mut TcpStream,
     pipe_r: &mut PipeReader,
     pipe_w: &mut PipeWriter,
 ) -> Result<(), ReadFileErr> {
@@ -319,7 +385,7 @@ fn get_fd_and_size(
 
 fn write_response_and_close(
     ring: &mut IoUring,
-    stream: &mut KtlsStream<TcpStream>,
+    stream: &mut TcpStream,
     fd: types::Fd,
     file_size: StatxSize,
     file: &FileToServe,
@@ -332,9 +398,7 @@ fn write_response_and_close(
     let mut num_sqe = 0;
     // send header keep buffer untill it has been confirmed it is sent
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
-    let mut num_sqe = 1;
-
-    let mut offsets: Vec<(u32, u32)> = Vec::new();
+    num_sqe += 1;
 
     // written to pipe <= written to socket
     // If written to pipe >= pipe_size, then a splice from pipe to socket should occur before the splice from file to pipe.
@@ -342,6 +406,8 @@ fn write_response_and_close(
     let mut written_to_socket = 0;
 
     while written_to_socket < file_size as usize {
+        info!("socket: {written_to_socket}, file: {written_to_pipe}");
+        info!("num_sqe before: {num_sqe}");
         num_sqe += add_splice_sqes(
             ring,
             fd,
@@ -353,13 +419,9 @@ fn write_response_and_close(
             file_size as usize,
         )?;
 
-        info!("starting to wait");
+        info!("starting to wait for {num_sqe}");
         let res = ring.submit_and_wait(num_sqe).expect("err");
-        info!(
-            "COMPLETED WAITING FOR SUBMISSIONS {res}, {num_sqe}, {}",
-            // offsets.capacity()
-            0
-        );
+        info!("COMPLETED WAITING FOR SUBMISSIONS {res}, {num_sqe}");
 
         for cqe in ring.completion() {
             info!("{:?}", cqe);
@@ -404,6 +466,7 @@ fn add_splice_sqes(
     let pipe_size =
         *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()));
     let mut id = 0;
+    let mut num_sqe = 0;
     let flags = 0;
 
     // written to pipe <= written to socket always.
@@ -412,29 +475,35 @@ fn add_splice_sqes(
     // then a splice from pipe to socket should
     // occur before the splice from file to pipe.
     let in_pipe = written_to_pipe - written_to_socket;
-    if in_pipe > 0 {
-        // writes are odd numbered
-        id += 1;
-        spliced_write(ring, fd_write, pipe_r, pipe_size as u32, id, flags)?;
-        id += 1;
-    }
+    // TODO: reenable
+    // if in_pipe > 0 {
+    //     // writes are odd numbered
+    //     id += 1;
+    //     spliced_write(ring, fd_write, pipe_r, pipe_size as u32, id, flags)?;
+    //     num_sqe += 1;
+    //     id += 1;
+    // }
 
-    for offset in (written_to_pipe..file_size).step_by(pipe_size as usize) {
+    for offset in (written_to_socket..file_size).step_by(pipe_size as usize) {
         let remaining = file_size.saturating_sub(offset);
         let len = remaining.min(pipe_size as usize) as u32;
         // submit enough requests to send the whole file.
         // WARNING: This can overflow the io_uring submission queue.
-        let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
-        if remaining == 0 {
-            flags = SPLICE_F_MOVE;
-        }
+        // let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
+        // if remaining == 0 {
+        //     flags = SPLICE_F_MOVE;
+        // }
 
-        spliced_read(ring, fd_read, pipe_w, offset as i64, len, id as u64, flags)?;
+        if written_to_pipe < file_size {
+            spliced_read(ring, fd_read, pipe_w, offset as i64, len, id as u64, flags)?;
+            num_sqe += 1;
+        }
         id += 1;
         spliced_write(ring, fd_write, pipe_r, pipe_size, id, flags)?;
+        num_sqe += 1;
         id += 1;
     }
-    return Ok(id as usize);
+    return Ok(num_sqe);
 }
 
 fn spliced_read(
