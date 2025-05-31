@@ -65,6 +65,7 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
     // let acceptor = Rc::new(acceptor);
 
     let listener = TcpListener::bind("127.0.0.0:12345").await.unwrap();
+    info!("Listening on: {:?}", listener.local_addr().unwrap());
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -80,6 +81,7 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
                     let mut ktls_stream = config_ktls_server(tls_stream).await.unwrap();
 
                     let (drained, mut stream) = ktls_stream.into_raw();
+                    info!("drained: {:?}", drained);
                     let drained = drained.unwrap_or_default();
 
                     info!("{} bytes already decoded by rustls", drained.len());
@@ -94,7 +96,15 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
                     //         std::mem::size_of_val(&one) as _,
                     //     );
                     // }
-                    handle_client(&mut stream, &drained).await.expect("ERROR");
+                    handle_client(&mut stream, drained.clone())
+                        .await
+                        .expect("ERROR");
+
+                    info!("READING");
+                    let mut dst: [u8; 1024] = [0; 1024];
+                    let n_bytes = stream.read(&mut dst).await.expect("err");
+                    info!("{:?}", String::from_utf8(dst.to_vec()));
+                    info!("{}", n_bytes);
                     info!("FINISHED SENDING FILE!");
                     let x = stream.flush().await;
                     info!("FINISHED flushing {:?}!", x);
@@ -102,6 +112,7 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
                     let x = stream.shutdown().await;
 
                     info!("SHUTDOWN!, {:?}", x);
+                    drop(drained);
                     // let one: libc::c_int = 0;
                     // unsafe {
                     //     libc::setsockopt(
@@ -223,7 +234,7 @@ impl FileToServe {
     }
 }
 
-async fn handle_client(stream: &mut TcpStream, drained: &Vec<u8>) -> io::Result<()> {
+async fn handle_client(stream: &mut TcpStream, drained: Vec<u8>) -> io::Result<()> {
     // let mut dst: [u8; 1024] = [0; 1024];
     // let n_bytes = stream.read(&mut dst).await.expect("err");
     // info!("{:?}", String::from_utf8(dst.to_vec()));
