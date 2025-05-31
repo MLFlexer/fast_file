@@ -16,3 +16,8 @@ Use auth somehow before initializing access to fs.
 
 ## Motivation
 Nextcloud is slow AF
+
+## Enabling kTLS
+```sh
+sudo modprobe tls
+```

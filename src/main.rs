@@ -61,7 +61,7 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     // let acceptor = Rc::new(acceptor);
 
-    let listener = TcpListener::bind("192.168.0.42:12345").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.0:12345").await.unwrap();
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -247,6 +247,7 @@ fn open_file(ring: &mut IoUring, path: &CStr) -> Result<(), ReadFileErr> {
         .build()
         .flags(Flags::IO_LINK);
 
+    // TODO: might already be opened by another thread?
     if let Err(e) = unsafe { ring.submission().push(&openat_e) } {
         error!("Submission error: {e}");
         return Err(ReadFileErr::FailedPush);
@@ -328,143 +329,112 @@ fn write_response_and_close(
     let pipe_size = *PIPE_DEFAULT_SIZE
         .get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()))
         as usize;
-    let mut total_sub = 0;
+    let mut num_sqe = 0;
+    // send header keep buffer untill it has been confirmed it is sent
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
-    total_sub += 1;
+    let mut num_sqe = 1;
 
     let mut offsets: Vec<(u32, u32)> = Vec::new();
 
-    for (idx, offset) in (0..file_size).step_by(pipe_size).enumerate() {
+    // written to pipe <= written to socket
+    // If written to pipe >= pipe_size, then a splice from pipe to socket should occur before the splice from file to pipe.
+    let mut written_to_pipe = 0;
+    let mut written_to_socket = 0;
+
+    while written_to_socket < file_size as usize {
+        num_sqe += add_splice_sqes(
+            ring,
+            fd,
+            pipe_w,
+            types::Fd(stream.as_raw_fd()),
+            pipe_r,
+            written_to_pipe,
+            written_to_socket,
+            file_size as usize,
+        )?;
+
+        info!("starting to wait");
+        let res = ring.submit_and_wait(num_sqe).expect("err");
+        info!(
+            "COMPLETED WAITING FOR SUBMISSIONS {res}, {num_sqe}, {}",
+            // offsets.capacity()
+            0
+        );
+
+        for cqe in ring.completion() {
+            info!("{:?}", cqe);
+
+            match (cqe.user_data(), cqe.result()) {
+                (u64::MAX, r) if r < 0 => {
+                    // send header again
+                    todo!();
+                }
+                (id, r) if id % 2 == 0 && r > 0 => {
+                    // file -> pipe
+                    written_to_pipe += r as usize;
+                }
+                (id, r) if id % 2 == 1 && r > 0 => {
+                    // pipe -> socket
+                    written_to_socket += r as usize;
+                }
+                _ => {
+                    continue;
+                }
+            }
+        }
+        num_sqe = 0;
+    }
+    // TODO: can close while other use it?
+    close_file(ring, fd)?;
+    let _res = ring.submit_and_wait(1).expect("err");
+    drop(header_buffer);
+    Ok(())
+}
+
+fn add_splice_sqes(
+    ring: &mut IoUring,
+    fd_read: types::Fd,
+    pipe_w: &mut PipeWriter,
+    fd_write: types::Fd,
+    pipe_r: &mut PipeReader,
+    written_to_pipe: usize,
+    written_to_socket: usize,
+    file_size: usize,
+) -> Result<usize, ReadFileErr> {
+    let pipe_size =
+        *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()));
+    let mut id = 0;
+    let flags = 0;
+
+    // written to pipe <= written to socket always.
+    //
+    // If written to pipe >= pipe_size,
+    // then a splice from pipe to socket should
+    // occur before the splice from file to pipe.
+    let in_pipe = written_to_pipe - written_to_socket;
+    if in_pipe > 0 {
+        // writes are odd numbered
+        id += 1;
+        spliced_write(ring, fd_write, pipe_r, pipe_size as u32, id, flags)?;
+        id += 1;
+    }
+
+    for offset in (written_to_pipe..file_size).step_by(pipe_size as usize) {
         let remaining = file_size.saturating_sub(offset);
-        let len = remaining.min(pipe_size as u64) as u32;
+        let len = remaining.min(pipe_size as usize) as u32;
         // submit enough requests to send the whole file.
         // WARNING: This can overflow the io_uring submission queue.
-        let idx = idx * 2;
-        info!("idx: {}", idx);
         let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
         if remaining == 0 {
             flags = SPLICE_F_MOVE;
         }
 
-        spliced_read(ring, fd, pipe_w, offset as i64, len, idx as u64, flags)?;
-        total_sub += 1;
-        offsets.push((offset as u32, len));
-        spliced_write(
-            ring,
-            types::Fd(stream.as_raw_fd()),
-            pipe_r,
-            len,
-            idx as u64 + 1,
-            flags,
-        )?;
-        total_sub += 1;
-        offsets.push((offset as u32, len));
+        spliced_read(ring, fd_read, pipe_w, offset as i64, len, id as u64, flags)?;
+        id += 1;
+        spliced_write(ring, fd_write, pipe_r, pipe_size, id, flags)?;
+        id += 1;
     }
-    close_file(ring, fd)?;
-    total_sub += 1;
-
-    loop {
-        info!("starting to wait");
-        match ring.submit_and_wait(total_sub) {
-            Err(_e) => {
-                info!("ERROR WHEN WAITING FOR SUBMISSIONS");
-                return Err(ReadFileErr::Submission);
-            }
-            Ok(i) => {
-                info!(
-                    "COMPLETED WAITING FOR SUBMISSIONS {i}, {total_sub}, {}",
-                    offsets.capacity()
-                );
-            }
-        }
-
-        let prev_total_sub = total_sub;
-        total_sub = 0;
-
-        let mut failed_idx = None;
-        for _ in 0..prev_total_sub {
-            let cqe = ring.completion().next().unwrap();
-            info!("{:?}", cqe);
-
-            match cqe.user_data() {
-                i if i == u64::MAX => {
-                    // open
-                }
-                i if i == u64::MAX - 1 => {
-                    // close
-                    if failed_idx.is_some() {
-                        close_file(ring, fd)?;
-                        total_sub += 1;
-                    }
-                }
-                idx if idx % 2 == 0 => {
-                    // read splice
-                    if cqe.result() < 0 {
-                        let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
-                        if idx == offsets.len() as u64 - 1 {
-                            flags = SPLICE_F_MOVE;
-                        }
-                        let (offset, len) = offsets[idx as usize];
-                        spliced_read(ring, fd, pipe_w, offset as i64, len, idx as u64, flags)?;
-                        total_sub += 1;
-                    }
-                }
-                idx if idx % 2 == 1 => {
-                    // write splice
-                    if cqe.result() < 0 {
-                        let (_, len) = offsets[idx as usize];
-                        let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
-                        if idx == offsets.len() as u64 - 1 {
-                            flags = SPLICE_F_MOVE;
-                        }
-                        spliced_write(
-                            ring,
-                            types::Fd(stream.as_raw_fd()),
-                            pipe_r,
-                            len,
-                            idx as u64,
-                            flags,
-                        )?;
-                        total_sub += 1;
-
-                        if let None = failed_idx {
-                            failed_idx = Some(idx);
-                        }
-                    } else {
-                        let (_, len) = offsets[idx as usize];
-                        if cqe.result() < len as i32 {
-                            let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
-                            if idx == offsets.len() as u64 - 1 {
-                                flags = SPLICE_F_MOVE;
-                            }
-                            spliced_write(
-                                ring,
-                                types::Fd(stream.as_raw_fd()),
-                                pipe_r,
-                                len - cqe.result() as u32,
-                                idx as u64,
-                                flags,
-                            )?;
-                            total_sub += 1;
-
-                            if let None = failed_idx {
-                                failed_idx = Some(idx);
-                            }
-                        }
-                    }
-                }
-                _ => todo!(),
-            }
-        }
-
-        if failed_idx == None {
-            break;
-        }
-    }
-    info!("COMPLETED SEND OF {:?}!", file.path);
-
-    drop(header_buffer);
-    Ok(())
+    return Ok(id as usize);
 }
 
 fn spliced_read(
