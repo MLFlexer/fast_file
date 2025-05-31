@@ -101,10 +101,10 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
                         .expect("ERROR");
 
                     info!("READING");
-                    let mut dst: [u8; 1024] = [0; 1024];
-                    let n_bytes = stream.read(&mut dst).await.expect("err");
-                    info!("{:?}", String::from_utf8(dst.to_vec()));
-                    info!("{}", n_bytes);
+                    // let mut dst: [u8; 1024] = [0; 1024];
+                    // let n_bytes = stream.read(&mut dst).await.expect("err");
+                    // info!("{:?}", String::from_utf8(dst.to_vec()));
+                    // info!("{}", n_bytes);
                     info!("FINISHED SENDING FILE!");
                     let x = stream.flush().await;
                     info!("FINISHED flushing {:?}!", x);
@@ -491,7 +491,7 @@ fn write_response_and_close2(
     while written_to_socket < file_size as usize {
         info!("socket: {written_to_socket}, file: {written_to_pipe}");
         info!("num_sqe before: {num_sqe}");
-        num_sqe += add_splice_sqes(
+        num_sqe += add_splice_sqes2(
             ring,
             fd,
             pipe_w,
@@ -536,7 +536,7 @@ fn write_response_and_close2(
     Ok(())
 }
 
-fn add_splice_sqes(
+fn add_splice_sqes_working(
     _ring: &mut IoUring, // unused if you're not submitting SQEs
     fd_read: types::Fd,
     pipe_w: &mut PipeWriter,
@@ -613,26 +613,136 @@ fn add_splice_sqes(
     Ok(num_sqe)
 }
 
+fn add_splice_sqes(
+    ring: &mut IoUring, // unused if you're not submitting SQEs
+    fd_read: types::Fd,
+    pipe_w: &mut PipeWriter,
+    fd_write: types::Fd,
+    pipe_r: &mut PipeReader,
+    written_to_pipe: usize,
+    written_to_socket: usize,
+    file_size: usize,
+) -> Result<usize, ReadFileErr> {
+    let pipe_size =
+        *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()));
+    let mut num_sqe = 0;
+    let flags = libc::SPLICE_F_MOVE;
+
+    let mut offset = written_to_socket;
+    while offset < file_size {
+        let remaining = file_size - offset;
+        let chunk_size = pipe_size.min(remaining.try_into().unwrap());
+
+        // Splice from file -> pipe
+        let mut spliced_in = 0;
+        while spliced_in < chunk_size {
+            let len = chunk_size - spliced_in;
+            // let n = unsafe {
+            //     libc::splice(
+            //         fd_read.0,
+            //         std::ptr::null_mut(),
+            //         pipe_w.as_raw_fd(),
+            //         std::ptr::null_mut(),
+            //         len.try_into().unwrap(),
+            //         flags,
+            //     )
+            // };
+
+            spliced_read(ring, fd_read, pipe_w, len, 0, flags)?;
+            // spliced_write(ring, fd_write, pipe_r, len as u32, 0, flags)?;
+            let res = ring.submit_and_wait(1).expect("err");
+            let cqe = ring.completion().next().unwrap();
+            info!("{:?}", cqe);
+            let n = cqe.result();
+            if n < 0 {
+                continue;
+            }
+            spliced_in += n as u32;
+        }
+
+        // Splice from pipe -> socket
+        let mut spliced_out = 0;
+        while spliced_out < spliced_in {
+            let len = spliced_in - spliced_out;
+
+            spliced_write(ring, fd_write, pipe_r, len as u32, 0, flags)?;
+            let res = ring.submit_and_wait(1).expect("err");
+            let cqe = ring.completion().next().unwrap();
+            info!("{:?}", cqe);
+            let n = cqe.result();
+            if n < 0 {
+                continue;
+            }
+            spliced_out += n as u32;
+        }
+
+        offset += spliced_out as usize;
+        num_sqe += 2; // one for read, one for write
+        info!("written to socket");
+    }
+
+    Ok(num_sqe)
+}
+
+fn add_splice_sqes2(
+    ring: &mut IoUring,
+    fd_read: types::Fd,
+    pipe_w: &mut PipeWriter,
+    fd_write: types::Fd,
+    pipe_r: &mut PipeReader,
+    written_to_pipe: usize,
+    written_to_socket: usize,
+    file_size: usize,
+) -> Result<usize, ReadFileErr> {
+    let pipe_size =
+        *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()));
+    let mut id = 0;
+    let flags = 0;
+
+    // written to pipe <= written to socket always.
+    //
+    // If written to pipe >= pipe_size,
+    // then a splice from pipe to socket should
+    // occur before the splice from file to pipe.
+    let in_pipe = written_to_pipe - written_to_socket;
+    if in_pipe > 0 {
+        // writes are odd numbered
+        id += 1;
+        spliced_write(ring, fd_write, pipe_r, pipe_size as u32, id, flags)?;
+        id += 1;
+    }
+
+    for offset in (written_to_pipe..file_size).step_by(pipe_size as usize) {
+        let remaining = file_size.saturating_sub(offset);
+        let len = remaining.min(pipe_size as usize) as u32;
+        // submit enough requests to send the whole file.
+        // WARNING: This can overflow the io_uring submission queue.
+        let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
+        if remaining == 0 {
+            flags = SPLICE_F_MOVE;
+        }
+
+        spliced_read(ring, fd_read, pipe_w, len, id as u64, flags)?;
+        id += 1;
+        spliced_write(ring, fd_write, pipe_r, pipe_size, id, flags)?;
+        id += 1;
+    }
+    return Ok(id as usize);
+}
+
 fn spliced_read(
     ring: &mut IoUring,
     fd_read: types::Fd,
     pipe_w: &mut PipeWriter,
-    offset: i64,
     len: u32,
     read_id: u64,
     flags: u32,
 ) -> Result<(), ReadFileErr> {
-    let splice_read_e = opcode::Splice::new(
-        fd_read,
-        offset as i64,
-        types::Fd(pipe_w.as_raw_fd()),
-        -1,
-        len,
-    )
-    .flags(flags)
-    .build()
-    .user_data(read_id)
-    .flags(Flags::IO_LINK);
+    let splice_read_e = opcode::Splice::new(fd_read, -1, types::Fd(pipe_w.as_raw_fd()), -1, len)
+        .flags(flags)
+        .build()
+        .user_data(read_id)
+        .flags(Flags::IO_LINK);
     info!("read req: {:?}", splice_read_e);
 
     if let Err(e) = unsafe { ring.submission().push(&splice_read_e) } {
