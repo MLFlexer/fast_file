@@ -1,7 +1,7 @@
 use io_uring::squeue::Flags;
 use io_uring::{IoUring, opcode, types};
 use ktls::{CorkStream, KtlsStream, config_ktls_server};
-use libc::{AT_FDCWD, O_RDONLY, SPLICE_F_MORE, SPLICE_F_MOVE, STATX_SIZE, statx};
+use libc::{AT_FDCWD, O_RDONLY, SPLICE_F_MORE, SPLICE_F_MOVE, STATX_SIZE, splice, statx};
 use log::{error, info};
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
@@ -10,9 +10,10 @@ use simple_logger::SimpleLogger;
 use std::ffi::{CStr, CString};
 use std::io::{PipeReader, PipeWriter, pipe};
 use std::mem::MaybeUninit;
+use std::os::fd::IntoRawFd;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::ptr::NonNull;
+use std::ptr::{NonNull, null_mut};
 use std::sync::{Arc, OnceLock};
 use std::{io, u64};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,8 +65,7 @@ async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     // let acceptor = Rc::new(acceptor);
 
-    let listener = TcpListener::bind("127.0.0.0:12345").await.unwrap();
-    info!("Listening on: {:?}", listener.local_addr().unwrap());
+    let listener = TcpListener::bind("192.168.0.42:12345").await.unwrap();
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -283,6 +283,7 @@ fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
         if flags < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        println!("FLAGS: {}", flags);
         if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -409,6 +410,77 @@ fn write_response_and_close(
     let mut num_sqe = 0;
     // send header keep buffer untill it has been confirmed it is sent
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
+    let _res = ring.submit_and_wait(1).expect("err");
+    num_sqe += 1;
+
+    // written to pipe <= written to socket
+    // If written to pipe >= pipe_size, then a splice from pipe to socket should occur before the splice from file to pipe.
+    let mut written_to_pipe = 0;
+    let mut written_to_socket = 0;
+
+    while written_to_socket < file_size as usize {
+        info!("socket: {written_to_socket}, file: {written_to_pipe}");
+        info!("num_sqe before: {num_sqe}");
+        num_sqe += add_splice_sqes(
+            ring,
+            fd,
+            pipe_w,
+            types::Fd(stream.as_raw_fd()),
+            pipe_r,
+            written_to_pipe,
+            written_to_socket,
+            file_size as usize,
+        )?;
+
+        info!("starting to wait for {num_sqe}");
+        // let res = ring.submit_and_wait(num_sqe).expect("err");
+        // info!("COMPLETED WAITING FOR SUBMISSIONS {res}, {num_sqe}");
+
+        // for cqe in ring.completion() {
+        //     info!("{:?}", cqe);
+
+        //     match (cqe.user_data(), cqe.result()) {
+        //         (u64::MAX, r) if r < 0 => {
+        //             // send header again
+        //             todo!();
+        //         }
+        //         (id, r) if id % 2 == 0 && r > 0 => {
+        //             // file -> pipe
+        //             written_to_pipe += r as usize;
+        //         }
+        //         (id, r) if id % 2 == 1 && r > 0 => {
+        //             // pipe -> socket
+        //             written_to_socket += r as usize;
+        //         }
+        //         _ => {
+        //             continue;
+        //         }
+        //     }
+        // }
+        break;
+    }
+    // TODO: can close while other use it?
+    close_file(ring, fd)?;
+    let _res = ring.submit_and_wait(1).expect("err");
+    drop(header_buffer);
+    Ok(())
+}
+
+fn write_response_and_close2(
+    ring: &mut IoUring,
+    stream: &mut TcpStream,
+    fd: types::Fd,
+    file_size: StatxSize,
+    file: &FileToServe,
+    pipe_r: &mut PipeReader,
+    pipe_w: &mut PipeWriter,
+) -> Result<(), ReadFileErr> {
+    let pipe_size = *PIPE_DEFAULT_SIZE
+        .get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()))
+        as usize;
+    let mut num_sqe = 0;
+    // send header keep buffer untill it has been confirmed it is sent
+    let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
     num_sqe += 1;
 
     // written to pipe <= written to socket
@@ -465,7 +537,7 @@ fn write_response_and_close(
 }
 
 fn add_splice_sqes(
-    ring: &mut IoUring,
+    _ring: &mut IoUring, // unused if you're not submitting SQEs
     fd_read: types::Fd,
     pipe_w: &mut PipeWriter,
     fd_write: types::Fd,
@@ -476,45 +548,69 @@ fn add_splice_sqes(
 ) -> Result<usize, ReadFileErr> {
     let pipe_size =
         *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()));
-    let mut id = 0;
     let mut num_sqe = 0;
-    let flags = 0;
+    let flags = libc::SPLICE_F_MOVE;
 
-    // written to pipe <= written to socket always.
-    //
-    // If written to pipe >= pipe_size,
-    // then a splice from pipe to socket should
-    // occur before the splice from file to pipe.
-    let in_pipe = written_to_pipe - written_to_socket;
-    // TODO: reenable
-    // if in_pipe > 0 {
-    //     // writes are odd numbered
-    //     id += 1;
-    //     spliced_write(ring, fd_write, pipe_r, pipe_size as u32, id, flags)?;
-    //     num_sqe += 1;
-    //     id += 1;
-    // }
+    let mut offset = written_to_socket;
+    while offset < file_size {
+        let remaining = file_size - offset;
+        let chunk_size = pipe_size.min(remaining.try_into().unwrap());
 
-    for offset in (written_to_socket..file_size).step_by(pipe_size as usize) {
-        let remaining = file_size.saturating_sub(offset);
-        let len = remaining.min(pipe_size as usize) as u32;
-        // submit enough requests to send the whole file.
-        // WARNING: This can overflow the io_uring submission queue.
-        // let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
-        // if remaining == 0 {
-        //     flags = SPLICE_F_MOVE;
-        // }
-
-        if written_to_pipe < file_size {
-            spliced_read(ring, fd_read, pipe_w, offset as i64, len, id as u64, flags)?;
-            num_sqe += 1;
+        // Splice from file -> pipe
+        let mut spliced_in = 0;
+        while spliced_in < chunk_size {
+            let len = chunk_size - spliced_in;
+            let n = unsafe {
+                libc::splice(
+                    fd_read.0,
+                    std::ptr::null_mut(),
+                    pipe_w.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    len.try_into().unwrap(),
+                    flags,
+                )
+            };
+            if n == -1 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EAGAIN || errno == libc::EINTR {
+                    continue;
+                } else {
+                    return Err(ReadFileErr::OpenAt);
+                }
+            }
+            spliced_in += n as u32;
         }
-        id += 1;
-        spliced_write(ring, fd_write, pipe_r, pipe_size, id, flags)?;
-        num_sqe += 1;
-        id += 1;
+
+        // Splice from pipe -> socket
+        let mut spliced_out = 0;
+        while spliced_out < spliced_in {
+            let len = spliced_in - spliced_out;
+            let n = unsafe {
+                libc::splice(
+                    pipe_r.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    fd_write.0,
+                    std::ptr::null_mut(),
+                    len.try_into().unwrap(),
+                    flags,
+                )
+            };
+            if n == -1 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EAGAIN || errno == libc::EINTR {
+                    continue;
+                } else {
+                    return Err(ReadFileErr::OpenAt);
+                }
+            }
+            spliced_out += n as u32;
+        }
+
+        offset += spliced_out as usize;
+        num_sqe += 2; // one for read, one for write
     }
-    return Ok(num_sqe);
+
+    Ok(num_sqe)
 }
 
 fn spliced_read(
