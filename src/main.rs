@@ -618,6 +618,10 @@ fn add_splice_sqes(
             info!("{:?}", cqe);
             let n = cqe.result();
             if n < 0 {
+                if n == -125 {
+                    info!("cancelled");
+                    continue;
+                }
                 let e: SpliceError = (-n).into();
                 info!("{:?}", e);
                 continue;
