@@ -1,7 +1,7 @@
 use io_uring::squeue::Flags;
 use io_uring::{IoUring, opcode, types};
-use ktls::{CorkStream, KtlsStream, config_ktls_server};
-use libc::{AT_FDCWD, O_RDONLY, SPLICE_F_MORE, SPLICE_F_MOVE, STATX_SIZE, splice, statx};
+use ktls::{CorkStream, config_ktls_server};
+use libc::{AT_FDCWD, O_RDONLY, SPLICE_F_MORE, SPLICE_F_MOVE, STATX_SIZE, statx};
 use log::{error, info};
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
@@ -10,16 +10,37 @@ use simple_logger::SimpleLogger;
 use std::ffi::{CStr, CString};
 use std::io::{PipeReader, PipeWriter, pipe};
 use std::mem::MaybeUninit;
-use std::os::fd::IntoRawFd;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::ptr::{NonNull, null_mut};
+use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 use std::{env, io, u64};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 extern crate libc;
+
+#[derive(Debug)]
+enum SpliceError {
+    EAGAIN,
+    EBADF,
+    EINVAL,
+    ENOMEM,
+    ESPIPE,
+}
+
+impl From<i32> for SpliceError {
+    fn from(value: i32) -> Self {
+        match value {
+            libc::EAGAIN => SpliceError::EAGAIN,
+            libc::EBADF => SpliceError::EBADF,
+            libc::EINVAL => SpliceError::EINVAL,
+            libc::ENOMEM => SpliceError::ENOMEM,
+            libc::ESPIPE => SpliceError::ESPIPE,
+            _ => todo!(),
+        }
+    }
+}
 
 static PIPE_DEFAULT_SIZE: OnceLock<u32> = OnceLock::new();
 
@@ -94,7 +115,7 @@ async fn tcp_listener(
                 Ok(tls_stream) => {
                     println!("Connection accepted from {:?}", addr);
 
-                    let mut ktls_stream = config_ktls_server(tls_stream).await.unwrap();
+                    let ktls_stream = config_ktls_server(tls_stream).await.unwrap();
 
                     let (drained, mut stream) = ktls_stream.into_raw();
                     info!("drained: {:?}", drained);
@@ -420,15 +441,13 @@ fn write_response_and_close(
     pipe_r: &mut PipeReader,
     pipe_w: &mut PipeWriter,
 ) -> Result<(), ReadFileErr> {
-    let pipe_size = *PIPE_DEFAULT_SIZE
-        .get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()))
-        as usize;
+    // let pipe_size = *PIPE_DEFAULT_SIZE .get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd())) as usize;
     let mut num_sqe = 0;
     // send header keep buffer untill it has been confirmed it is sent
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
     let _res = ring.submit_and_wait(1).expect("err");
     // TODO: should be part of the first uring splice
-    let cqe = ring.completion().next().unwrap();
+    let _cqe = ring.completion().next().unwrap();
     num_sqe += 1;
 
     // written to pipe <= written to socket
@@ -554,11 +573,11 @@ fn write_response_and_close2(
     Ok(())
 }
 
-fn add_splice_sqes_working(
-    _ring: &mut IoUring, // unused if you're not submitting SQEs
+fn add_splice_sqes(
+    ring: &mut IoUring,
     fd_read: types::Fd,
     pipe_w: &mut PipeWriter,
-    fd_write: types::Fd,
+    socket_fd: types::Fd,
     pipe_r: &mut PipeReader,
     written_to_pipe: usize,
     written_to_socket: usize,
@@ -569,73 +588,111 @@ fn add_splice_sqes_working(
     let mut num_sqe = 0;
     let flags = libc::SPLICE_F_MOVE;
 
-    let mut offset = written_to_socket;
-    while offset < file_size {
-        let remaining = file_size - offset;
-        let chunk_size = pipe_size.min(remaining.try_into().unwrap());
+    let mut spliced_in = 0;
+    let mut spliced_out = 0;
 
-        // Splice from file -> pipe
-        let mut spliced_in = 0;
-        while spliced_in < chunk_size {
-            let len = chunk_size - spliced_in;
-            let n = unsafe {
-                libc::splice(
-                    fd_read.0,
-                    std::ptr::null_mut(),
-                    pipe_w.as_raw_fd(),
-                    std::ptr::null_mut(),
-                    len.try_into().unwrap(),
-                    flags,
-                )
-            };
-            if n == -1 {
-                let errno = unsafe { *libc::__errno_location() };
-                if errno == libc::EAGAIN || errno == libc::EINTR {
-                    continue;
-                } else {
-                    return Err(ReadFileErr::OpenAt);
-                }
-            }
-            spliced_in += n as u32;
+    while spliced_out < file_size {
+        // if spliced in > out then drain pipe first.
+
+        let mut remaining = file_size - spliced_in;
+
+        for offset in (spliced_in..file_size).step_by(pipe_size as usize) {
+            let remaining = file_size.saturating_sub(offset);
+            let len = remaining.min(pipe_size as usize) as u32;
+            // submit enough requests to send the whole file.
+            // WARNING: This can overflow the io_uring submission queue.
+            // let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
+            // if remaining == 0 {
+            //     flags = SPLICE_F_MOVE;
+            // }
+
+            spliced_file_to_pipe(ring, fd_read, pipe_w, len, 0, flags)?;
+            num_sqe += 1;
+            spliced_pipe_to_socket(ring, socket_fd, pipe_r, pipe_size, 1, flags)?;
+            num_sqe += 1;
         }
 
-        // Splice from pipe -> socket
-        let mut spliced_out = 0;
-        while spliced_out < spliced_in {
-            let len = spliced_in - spliced_out;
-            let n = unsafe {
-                libc::splice(
-                    pipe_r.as_raw_fd(),
-                    std::ptr::null_mut(),
-                    fd_write.0,
-                    std::ptr::null_mut(),
-                    len.try_into().unwrap(),
-                    flags,
-                )
-            };
-            if n == -1 {
-                let errno = unsafe { *libc::__errno_location() };
-                if errno == libc::EAGAIN || errno == libc::EINTR {
-                    continue;
-                } else {
-                    return Err(ReadFileErr::OpenAt);
-                }
+        let res = ring.submit_and_wait(num_sqe).expect("err");
+        for i in 0..num_sqe {
+            let cqe = ring.completion().next().unwrap();
+            info!("{:?}", cqe);
+            let n = cqe.result();
+            if n < 0 {
+                let e: SpliceError = (-n).into();
+                info!("{:?}", e);
+                continue;
             }
-            spliced_out += n as u32;
-        }
 
-        offset += spliced_out as usize;
-        num_sqe += 2; // one for read, one for write
+            if cqe.user_data() == 0 {
+                spliced_in += n as usize;
+            } else if cqe.user_data() == 1 {
+                spliced_out += n as usize;
+            } else {
+                todo!();
+            }
+        }
+        info!("spliced in: {spliced_in}");
+        info!("spliced out: {spliced_out}");
     }
+    info!("written to socket");
+
+    // let mut offset = written_to_socket;
+    // while offset < file_size {
+    //     let remaining = file_size - offset;
+    //     info!("remaining: {}", remaining);
+    //     let chunk_size = pipe_size.min(remaining.try_into().unwrap());
+
+    //     // Splice from file -> pipe
+    //     let mut spliced_in = 0;
+    //     while spliced_in < chunk_size {
+    //         let len = chunk_size - spliced_in;
+
+    //         spliced_file_to_pipe(ring, fd_read, pipe_w, len, 0, flags)?;
+    //         let res = ring.submit_and_wait(1).expect("err");
+    //         let cqe = ring.completion().next().unwrap();
+    //         info!("{:?}", cqe);
+    //         let n = cqe.result();
+    //         if n < 0 {
+    //             let e: SpliceError = (-n).into();
+    //             info!("{:?}", e);
+    //             continue;
+    //         }
+    //         spliced_in += n as u32;
+    //     }
+    //     info!("spliced in: {spliced_in}");
+
+    //     // Splice from pipe -> socket
+    //     let mut spliced_out = 0;
+    //     while spliced_out < spliced_in {
+    //         let len = spliced_in - spliced_out;
+
+    //         spliced_pipe_to_socket(ring, socket_fd, pipe_r, len as u32, 0, flags)?;
+    //         let res = ring.submit_and_wait(1).expect("err");
+    //         let cqe = ring.completion().next().unwrap();
+    //         info!("{:?}", cqe);
+    //         let n = cqe.result();
+    //         if n < 0 {
+    //             let e: SpliceError = (-n).into();
+    //             info!("{:?}", e);
+    //             continue;
+    //         }
+    //         spliced_out += n as u32;
+    //     }
+    //     info!("spliced out: {spliced_out}");
+
+    //     offset += spliced_out as usize;
+    //     num_sqe += 2; // one for read, one for write
+    //     info!("written to socket");
+    // }
 
     Ok(num_sqe)
 }
 
-fn add_splice_sqes(
+fn add_splice_sqes_working(
     ring: &mut IoUring, // unused if you're not submitting SQEs
     fd_read: types::Fd,
     pipe_w: &mut PipeWriter,
-    fd_write: types::Fd,
+    socket_fd: types::Fd,
     pipe_r: &mut PipeReader,
     written_to_pipe: usize,
     written_to_socket: usize,
@@ -656,19 +713,8 @@ fn add_splice_sqes(
         let mut spliced_in = 0;
         while spliced_in < chunk_size {
             let len = chunk_size - spliced_in;
-            // let n = unsafe {
-            //     libc::splice(
-            //         fd_read.0,
-            //         std::ptr::null_mut(),
-            //         pipe_w.as_raw_fd(),
-            //         std::ptr::null_mut(),
-            //         len.try_into().unwrap(),
-            //         flags,
-            //     )
-            // };
 
-            spliced_read(ring, fd_read, pipe_w, len, 0, flags)?;
-            // spliced_write(ring, fd_write, pipe_r, len as u32, 0, flags)?;
+            spliced_file_to_pipe(ring, fd_read, pipe_w, len, 0, flags)?;
             let res = ring.submit_and_wait(1).expect("err");
             let cqe = ring.completion().next().unwrap();
             info!("{:?}", cqe);
@@ -687,7 +733,7 @@ fn add_splice_sqes(
         while spliced_out < spliced_in {
             let len = spliced_in - spliced_out;
 
-            spliced_write(ring, fd_write, pipe_r, len as u32, 0, flags)?;
+            spliced_pipe_to_socket(ring, socket_fd, pipe_r, len as u32, 0, flags)?;
             let res = ring.submit_and_wait(1).expect("err");
             let cqe = ring.completion().next().unwrap();
             info!("{:?}", cqe);
@@ -707,28 +753,6 @@ fn add_splice_sqes(
     }
 
     Ok(num_sqe)
-}
-
-#[derive(Debug)]
-enum SpliceError {
-    EAGAIN,
-    EBADF,
-    EINVAL,
-    ENOMEM,
-    ESPIPE,
-}
-
-impl From<i32> for SpliceError {
-    fn from(value: i32) -> Self {
-        match value {
-            libc::EAGAIN => SpliceError::EAGAIN,
-            libc::EBADF => SpliceError::EBADF,
-            libc::EINVAL => SpliceError::EINVAL,
-            libc::ENOMEM => SpliceError::ENOMEM,
-            libc::ESPIPE => SpliceError::ESPIPE,
-            _ => todo!(),
-        }
-    }
 }
 
 fn add_splice_sqes2(
@@ -755,7 +779,7 @@ fn add_splice_sqes2(
     if in_pipe > 0 {
         // writes are odd numbered
         id += 1;
-        spliced_write(ring, fd_write, pipe_r, pipe_size as u32, id, flags)?;
+        spliced_pipe_to_socket(ring, fd_write, pipe_r, pipe_size as u32, id, flags)?;
         id += 1;
     }
 
@@ -769,15 +793,15 @@ fn add_splice_sqes2(
             flags = SPLICE_F_MOVE;
         }
 
-        spliced_read(ring, fd_read, pipe_w, len, id as u64, flags)?;
+        spliced_file_to_pipe(ring, fd_read, pipe_w, len, id as u64, flags)?;
         id += 1;
-        spliced_write(ring, fd_write, pipe_r, pipe_size, id, flags)?;
+        spliced_pipe_to_socket(ring, fd_write, pipe_r, pipe_size, id, flags)?;
         id += 1;
     }
     return Ok(id as usize);
 }
 
-fn spliced_read(
+fn spliced_file_to_pipe(
     ring: &mut IoUring,
     fd_read: types::Fd,
     pipe_w: &mut PipeWriter,
@@ -800,7 +824,7 @@ fn spliced_read(
     return Ok(());
 }
 
-fn spliced_write(
+fn spliced_pipe_to_socket(
     ring: &mut IoUring,
     fd_write: types::Fd,
     pipe_r: &mut PipeReader,
