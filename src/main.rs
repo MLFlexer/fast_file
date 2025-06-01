@@ -15,7 +15,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::{NonNull, null_mut};
 use std::sync::{Arc, OnceLock};
-use std::{io, u64};
+use std::{env, io, u64};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -32,7 +32,7 @@ fn set_pipe_size(fd1: i32, fd2: i32) -> u32 {
     if size2 == -1 {
         panic!("COULD NOT GET SIZE OF PIPE!");
     }
-    return (size.min(size2)).min(16384) as u32;
+    return (size.min(size2)).min(2_i32.pow(14)) as u32;
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -41,8 +41,18 @@ async fn main() {
         .with_level(log::LevelFilter::Info)
         .init()
         .unwrap();
+
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 3 {
+        error!("Usage: {} <address> <port>", args[0]);
+        std::process::exit(1);
+    }
+
+    let address = &args[1];
+    let port = &args[2];
+
     let conf = tls_config();
-    let _ = tcp_listener(conf).await;
+    let _ = tcp_listener(conf, address, port).await;
 }
 
 fn tls_config() -> ServerConfig {
@@ -61,11 +71,17 @@ fn tls_config() -> ServerConfig {
     return config;
 }
 
-async fn tcp_listener(config: ServerConfig) -> std::io::Result<()> {
+async fn tcp_listener(
+    config: ServerConfig,
+    address: &String,
+    port: &String,
+) -> std::io::Result<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     // let acceptor = Rc::new(acceptor);
 
-    let listener = TcpListener::bind("192.168.0.42:12345").await.unwrap();
+    let full_addr = format!("{}:{}", address, port);
+    info!("Listening on: https://{}", full_addr);
+    let listener = TcpListener::bind(full_addr.as_str()).await.unwrap();
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -411,6 +427,8 @@ fn write_response_and_close(
     // send header keep buffer untill it has been confirmed it is sent
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
     let _res = ring.submit_and_wait(1).expect("err");
+    // TODO: should be part of the first uring splice
+    let cqe = ring.completion().next().unwrap();
     num_sqe += 1;
 
     // written to pipe <= written to socket
@@ -631,6 +649,7 @@ fn add_splice_sqes(
     let mut offset = written_to_socket;
     while offset < file_size {
         let remaining = file_size - offset;
+        info!("remaining: {}", remaining);
         let chunk_size = pipe_size.min(remaining.try_into().unwrap());
 
         // Splice from file -> pipe
@@ -655,10 +674,13 @@ fn add_splice_sqes(
             info!("{:?}", cqe);
             let n = cqe.result();
             if n < 0 {
+                let e: SpliceError = (-n).into();
+                info!("{:?}", e);
                 continue;
             }
             spliced_in += n as u32;
         }
+        info!("spliced in: {spliced_in}");
 
         // Splice from pipe -> socket
         let mut spliced_out = 0;
@@ -671,10 +693,13 @@ fn add_splice_sqes(
             info!("{:?}", cqe);
             let n = cqe.result();
             if n < 0 {
+                let e: SpliceError = (-n).into();
+                info!("{:?}", e);
                 continue;
             }
             spliced_out += n as u32;
         }
+        info!("spliced out: {spliced_out}");
 
         offset += spliced_out as usize;
         num_sqe += 2; // one for read, one for write
@@ -682,6 +707,28 @@ fn add_splice_sqes(
     }
 
     Ok(num_sqe)
+}
+
+#[derive(Debug)]
+enum SpliceError {
+    EAGAIN,
+    EBADF,
+    EINVAL,
+    ENOMEM,
+    ESPIPE,
+}
+
+impl From<i32> for SpliceError {
+    fn from(value: i32) -> Self {
+        match value {
+            libc::EAGAIN => SpliceError::EAGAIN,
+            libc::EBADF => SpliceError::EBADF,
+            libc::EINVAL => SpliceError::EINVAL,
+            libc::ENOMEM => SpliceError::ENOMEM,
+            libc::ESPIPE => SpliceError::ESPIPE,
+            _ => todo!(),
+        }
+    }
 }
 
 fn add_splice_sqes2(
