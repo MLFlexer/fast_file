@@ -1,8 +1,10 @@
 use io_uring::squeue::Flags;
 use io_uring::{IoUring, opcode, types};
 use ktls::{CorkStream, config_ktls_server};
-use libc::{AT_FDCWD, O_RDONLY, SPLICE_F_MORE, SPLICE_F_MOVE, STATX_SIZE, statx};
-use log::{error, info};
+use libc::{
+    AT_FDCWD, O_RDONLY, POSIX_MADV_SEQUENTIAL, SPLICE_F_MORE, SPLICE_F_MOVE, STATX_SIZE, statx,
+};
+use log::{error, info, warn};
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -12,7 +14,7 @@ use std::io::{PipeReader, PipeWriter, pipe};
 use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::ptr::NonNull;
+use std::ptr::{NonNull, null_mut};
 use std::sync::{Arc, OnceLock};
 use std::{env, io, u64};
 use tokio::io::AsyncWriteExt;
@@ -42,19 +44,21 @@ impl From<i32> for SpliceError {
     }
 }
 
-static PIPE_DEFAULT_SIZE: OnceLock<u32> = OnceLock::new();
+// static PIPE_DEFAULT_SIZE: OnceLock<u32> = OnceLock::new();
 
-fn set_pipe_size(fd1: i32, fd2: i32) -> u32 {
-    let size = unsafe { libc::fcntl(fd1, libc::F_GETPIPE_SZ) };
-    let size2 = unsafe { libc::fcntl(fd2, libc::F_GETPIPE_SZ) };
-    if size == -1 {
-        panic!("COULD NOT GET SIZE OF PIPE!");
-    }
-    if size2 == -1 {
-        panic!("COULD NOT GET SIZE OF PIPE!");
-    }
-    return (size.min(size2)).min(2_i32.pow(14)) as u32;
-}
+// fn set_pipe_size(fd1: i32, fd2: i32) -> u32 {
+//     let size = unsafe { libc::fcntl(fd1, libc::F_GETPIPE_SZ) };
+//     let size2 = unsafe { libc::fcntl(fd2, libc::F_GETPIPE_SZ) };
+//     if size == -1 {
+//         panic!("COULD NOT GET SIZE OF PIPE!");
+//     }
+//     if size2 == -1 {
+//         panic!("COULD NOT GET SIZE OF PIPE!");
+//     }
+//     return (size.min(size2)).min(2_i32.pow(14)) as u32;
+// }
+
+const KTLS_SOCKET_SIZE: usize = 2_i32.pow(14) as usize;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -390,6 +394,21 @@ fn statx_file(
     Ok(())
 }
 
+fn fadvice_file(ring: &mut IoUring, fd: types::Fd) -> Result<(), ReadFileErr> {
+    let fadvice_e = opcode::Fadvise::new(
+        fd,
+        0,
+        libc::POSIX_MADV_SEQUENTIAL | libc::POSIX_FADV_NOREUSE,
+    )
+    .build();
+
+    if let Err(e) = unsafe { ring.submission().push(&fadvice_e) } {
+        error!("Submission error: {e}");
+        return Err(ReadFileErr::FailedPush);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 enum ReadFileErr {
     FailedPush,
@@ -441,131 +460,20 @@ fn write_response_and_close(
     pipe_r: &mut PipeReader,
     pipe_w: &mut PipeWriter,
 ) -> Result<(), ReadFileErr> {
-    // let pipe_size = *PIPE_DEFAULT_SIZE .get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd())) as usize;
-    let mut num_sqe = 0;
+    // fadvice_file(ring, fd)?;
     // send header keep buffer untill it has been confirmed it is sent
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
-    let _res = ring.submit_and_wait(1).expect("err");
+    let _res = ring.submit_and_wait(2).expect("err");
     // TODO: should be part of the first uring splice
     let _cqe = ring.completion().next().unwrap();
-    num_sqe += 1;
-
-    // written to pipe <= written to socket
-    // If written to pipe >= pipe_size, then a splice from pipe to socket should occur before the splice from file to pipe.
-    let mut written_to_pipe = 0;
-    let mut written_to_socket = 0;
-
-    while written_to_socket < file_size as usize {
-        info!("socket: {written_to_socket}, file: {written_to_pipe}");
-        info!("num_sqe before: {num_sqe}");
-        num_sqe += add_splice_sqes(
-            ring,
-            fd,
-            pipe_w,
-            types::Fd(stream.as_raw_fd()),
-            pipe_r,
-            written_to_pipe,
-            written_to_socket,
-            file_size as usize,
-        )?;
-
-        info!("starting to wait for {num_sqe}");
-        // let res = ring.submit_and_wait(num_sqe).expect("err");
-        // info!("COMPLETED WAITING FOR SUBMISSIONS {res}, {num_sqe}");
-
-        // for cqe in ring.completion() {
-        //     info!("{:?}", cqe);
-
-        //     match (cqe.user_data(), cqe.result()) {
-        //         (u64::MAX, r) if r < 0 => {
-        //             // send header again
-        //             todo!();
-        //         }
-        //         (id, r) if id % 2 == 0 && r > 0 => {
-        //             // file -> pipe
-        //             written_to_pipe += r as usize;
-        //         }
-        //         (id, r) if id % 2 == 1 && r > 0 => {
-        //             // pipe -> socket
-        //             written_to_socket += r as usize;
-        //         }
-        //         _ => {
-        //             continue;
-        //         }
-        //     }
-        // }
-        break;
-    }
-    // TODO: can close while other use it?
-    close_file(ring, fd)?;
-    let _res = ring.submit_and_wait(1).expect("err");
-    drop(header_buffer);
-    Ok(())
-}
-
-fn write_response_and_close2(
-    ring: &mut IoUring,
-    stream: &mut TcpStream,
-    fd: types::Fd,
-    file_size: StatxSize,
-    file: &FileToServe,
-    pipe_r: &mut PipeReader,
-    pipe_w: &mut PipeWriter,
-) -> Result<(), ReadFileErr> {
-    let pipe_size = *PIPE_DEFAULT_SIZE
-        .get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()))
-        as usize;
-    let mut num_sqe = 0;
-    // send header keep buffer untill it has been confirmed it is sent
-    let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
-    num_sqe += 1;
-
-    // written to pipe <= written to socket
-    // If written to pipe >= pipe_size, then a splice from pipe to socket should occur before the splice from file to pipe.
-    let mut written_to_pipe = 0;
-    let mut written_to_socket = 0;
-
-    while written_to_socket < file_size as usize {
-        info!("socket: {written_to_socket}, file: {written_to_pipe}");
-        info!("num_sqe before: {num_sqe}");
-        num_sqe += add_splice_sqes2(
-            ring,
-            fd,
-            pipe_w,
-            types::Fd(stream.as_raw_fd()),
-            pipe_r,
-            written_to_pipe,
-            written_to_socket,
-            file_size as usize,
-        )?;
-
-        info!("starting to wait for {num_sqe}");
-        let res = ring.submit_and_wait(num_sqe).expect("err");
-        info!("COMPLETED WAITING FOR SUBMISSIONS {res}, {num_sqe}");
-
-        for cqe in ring.completion() {
-            info!("{:?}", cqe);
-
-            match (cqe.user_data(), cqe.result()) {
-                (u64::MAX, r) if r < 0 => {
-                    // send header again
-                    todo!();
-                }
-                (id, r) if id % 2 == 0 && r > 0 => {
-                    // file -> pipe
-                    written_to_pipe += r as usize;
-                }
-                (id, r) if id % 2 == 1 && r > 0 => {
-                    // pipe -> socket
-                    written_to_socket += r as usize;
-                }
-                _ => {
-                    continue;
-                }
-            }
-        }
-        num_sqe = 0;
-    }
+    add_splice_sqes(
+        ring,
+        fd,
+        pipe_w,
+        types::Fd(stream.as_raw_fd()),
+        pipe_r,
+        file_size as usize,
+    )?;
     // TODO: can close while other use it?
     close_file(ring, fd)?;
     let _res = ring.submit_and_wait(1).expect("err");
@@ -579,12 +487,9 @@ fn add_splice_sqes(
     pipe_w: &mut PipeWriter,
     socket_fd: types::Fd,
     pipe_r: &mut PipeReader,
-    written_to_pipe: usize,
-    written_to_socket: usize,
     file_size: usize,
 ) -> Result<usize, ReadFileErr> {
-    let pipe_size =
-        *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()));
+    let chunk_size = KTLS_SOCKET_SIZE;
     let mut num_sqe = 0;
     let flags = libc::SPLICE_F_MOVE;
 
@@ -592,13 +497,23 @@ fn add_splice_sqes(
     let mut spliced_out = 0;
 
     while spliced_out < file_size {
-        // if spliced in > out then drain pipe first.
+        num_sqe = 0;
+        // drain pipe
+        if spliced_out < spliced_in {
+            spliced_pipe_to_socket(
+                ring,
+                socket_fd,
+                pipe_r,
+                (spliced_in - spliced_out) as u32,
+                1,
+                flags,
+            )?;
+            num_sqe += 1;
+        }
 
-        let mut remaining = file_size - spliced_in;
-
-        for offset in (spliced_in..file_size).step_by(pipe_size as usize) {
+        for offset in (spliced_in..file_size).step_by(chunk_size as usize) {
             let remaining = file_size.saturating_sub(offset);
-            let len = remaining.min(pipe_size as usize) as u32;
+            let len = remaining.min(chunk_size as usize) as u32;
             // submit enough requests to send the whole file.
             // WARNING: This can overflow the io_uring submission queue.
             // let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
@@ -608,10 +523,12 @@ fn add_splice_sqes(
 
             spliced_file_to_pipe(ring, fd_read, pipe_w, len, 0, flags)?;
             num_sqe += 1;
-            spliced_pipe_to_socket(ring, socket_fd, pipe_r, pipe_size, 1, flags)?;
+            spliced_pipe_to_socket(ring, socket_fd, pipe_r, chunk_size as u32, 1, flags)?;
             num_sqe += 1;
         }
+        poll_add(ring, socket_fd)?;
 
+        info!("Submitting and waiting for: {num_sqe}");
         let res = ring.submit_and_wait(num_sqe).expect("err");
         for i in 0..num_sqe {
             let cqe = ring.completion().next().unwrap();
@@ -619,11 +536,11 @@ fn add_splice_sqes(
             let n = cqe.result();
             if n < 0 {
                 if n == -125 {
-                    info!("cancelled");
+                    warn!("CANCELLED");
                     continue;
                 }
                 let e: SpliceError = (-n).into();
-                info!("{:?}", e);
+                error!("{:?}", e);
                 continue;
             }
 
@@ -635,174 +552,20 @@ fn add_splice_sqes(
                 todo!();
             }
         }
+
+        if spliced_out == file_size {}
+        // waiting on poll
+        if spliced_out < file_size {
+            let res = ring.submit_and_wait(1).expect("err");
+            let cqe = ring.completion().next().unwrap();
+            info!("{:?}", cqe);
+        }
         info!("spliced in: {spliced_in}");
         info!("spliced out: {spliced_out}");
     }
     info!("written to socket");
 
-    // let mut offset = written_to_socket;
-    // while offset < file_size {
-    //     let remaining = file_size - offset;
-    //     info!("remaining: {}", remaining);
-    //     let chunk_size = pipe_size.min(remaining.try_into().unwrap());
-
-    //     // Splice from file -> pipe
-    //     let mut spliced_in = 0;
-    //     while spliced_in < chunk_size {
-    //         let len = chunk_size - spliced_in;
-
-    //         spliced_file_to_pipe(ring, fd_read, pipe_w, len, 0, flags)?;
-    //         let res = ring.submit_and_wait(1).expect("err");
-    //         let cqe = ring.completion().next().unwrap();
-    //         info!("{:?}", cqe);
-    //         let n = cqe.result();
-    //         if n < 0 {
-    //             let e: SpliceError = (-n).into();
-    //             info!("{:?}", e);
-    //             continue;
-    //         }
-    //         spliced_in += n as u32;
-    //     }
-    //     info!("spliced in: {spliced_in}");
-
-    //     // Splice from pipe -> socket
-    //     let mut spliced_out = 0;
-    //     while spliced_out < spliced_in {
-    //         let len = spliced_in - spliced_out;
-
-    //         spliced_pipe_to_socket(ring, socket_fd, pipe_r, len as u32, 0, flags)?;
-    //         let res = ring.submit_and_wait(1).expect("err");
-    //         let cqe = ring.completion().next().unwrap();
-    //         info!("{:?}", cqe);
-    //         let n = cqe.result();
-    //         if n < 0 {
-    //             let e: SpliceError = (-n).into();
-    //             info!("{:?}", e);
-    //             continue;
-    //         }
-    //         spliced_out += n as u32;
-    //     }
-    //     info!("spliced out: {spliced_out}");
-
-    //     offset += spliced_out as usize;
-    //     num_sqe += 2; // one for read, one for write
-    //     info!("written to socket");
-    // }
-
     Ok(num_sqe)
-}
-
-fn add_splice_sqes_working(
-    ring: &mut IoUring, // unused if you're not submitting SQEs
-    fd_read: types::Fd,
-    pipe_w: &mut PipeWriter,
-    socket_fd: types::Fd,
-    pipe_r: &mut PipeReader,
-    written_to_pipe: usize,
-    written_to_socket: usize,
-    file_size: usize,
-) -> Result<usize, ReadFileErr> {
-    let pipe_size =
-        *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()));
-    let mut num_sqe = 0;
-    let flags = libc::SPLICE_F_MOVE;
-
-    let mut offset = written_to_socket;
-    while offset < file_size {
-        let remaining = file_size - offset;
-        info!("remaining: {}", remaining);
-        let chunk_size = pipe_size.min(remaining.try_into().unwrap());
-
-        // Splice from file -> pipe
-        let mut spliced_in = 0;
-        while spliced_in < chunk_size {
-            let len = chunk_size - spliced_in;
-
-            spliced_file_to_pipe(ring, fd_read, pipe_w, len, 0, flags)?;
-            let res = ring.submit_and_wait(1).expect("err");
-            let cqe = ring.completion().next().unwrap();
-            info!("{:?}", cqe);
-            let n = cqe.result();
-            if n < 0 {
-                let e: SpliceError = (-n).into();
-                info!("{:?}", e);
-                continue;
-            }
-            spliced_in += n as u32;
-        }
-        info!("spliced in: {spliced_in}");
-
-        // Splice from pipe -> socket
-        let mut spliced_out = 0;
-        while spliced_out < spliced_in {
-            let len = spliced_in - spliced_out;
-
-            spliced_pipe_to_socket(ring, socket_fd, pipe_r, len as u32, 0, flags)?;
-            let res = ring.submit_and_wait(1).expect("err");
-            let cqe = ring.completion().next().unwrap();
-            info!("{:?}", cqe);
-            let n = cqe.result();
-            if n < 0 {
-                let e: SpliceError = (-n).into();
-                info!("{:?}", e);
-                continue;
-            }
-            spliced_out += n as u32;
-        }
-        info!("spliced out: {spliced_out}");
-
-        offset += spliced_out as usize;
-        num_sqe += 2; // one for read, one for write
-        info!("written to socket");
-    }
-
-    Ok(num_sqe)
-}
-
-fn add_splice_sqes2(
-    ring: &mut IoUring,
-    fd_read: types::Fd,
-    pipe_w: &mut PipeWriter,
-    fd_write: types::Fd,
-    pipe_r: &mut PipeReader,
-    written_to_pipe: usize,
-    written_to_socket: usize,
-    file_size: usize,
-) -> Result<usize, ReadFileErr> {
-    let pipe_size =
-        *PIPE_DEFAULT_SIZE.get_or_init(|| set_pipe_size(pipe_r.as_raw_fd(), pipe_w.as_raw_fd()));
-    let mut id = 0;
-    let flags = 0;
-
-    // written to pipe <= written to socket always.
-    //
-    // If written to pipe >= pipe_size,
-    // then a splice from pipe to socket should
-    // occur before the splice from file to pipe.
-    let in_pipe = written_to_pipe - written_to_socket;
-    if in_pipe > 0 {
-        // writes are odd numbered
-        id += 1;
-        spliced_pipe_to_socket(ring, fd_write, pipe_r, pipe_size as u32, id, flags)?;
-        id += 1;
-    }
-
-    for offset in (written_to_pipe..file_size).step_by(pipe_size as usize) {
-        let remaining = file_size.saturating_sub(offset);
-        let len = remaining.min(pipe_size as usize) as u32;
-        // submit enough requests to send the whole file.
-        // WARNING: This can overflow the io_uring submission queue.
-        let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
-        if remaining == 0 {
-            flags = SPLICE_F_MOVE;
-        }
-
-        spliced_file_to_pipe(ring, fd_read, pipe_w, len, id as u64, flags)?;
-        id += 1;
-        spliced_pipe_to_socket(ring, fd_write, pipe_r, pipe_size, id, flags)?;
-        id += 1;
-    }
-    return Ok(id as usize);
 }
 
 fn spliced_file_to_pipe(
@@ -845,6 +608,21 @@ fn spliced_pipe_to_socket(
     info!("write req: {:?}", splice_write_e);
 
     if let Err(e) = unsafe { ring.submission().push(&splice_write_e) } {
+        error!("Submission error: {e}");
+        return Err(ReadFileErr::FailedPush);
+    }
+    return Ok(());
+}
+
+fn poll_add(ring: &mut IoUring, fd: types::Fd) -> Result<(), ReadFileErr> {
+    let poll_add_e = opcode::PollAdd::new(fd, libc::POLLOUT as u32)
+        .build()
+        .user_data(3)
+        .flags(Flags::IO_DRAIN);
+
+    info!("poll req: {:?}", poll_add_e);
+
+    if let Err(e) = unsafe { ring.submission().push(&poll_add_e) } {
         error!("Submission error: {e}");
         return Err(ReadFileErr::FailedPush);
     }
