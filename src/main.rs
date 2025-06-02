@@ -394,13 +394,8 @@ fn statx_file(
     Ok(())
 }
 
-fn fadvice_file(ring: &mut IoUring, fd: types::Fd) -> Result<(), ReadFileErr> {
-    let fadvice_e = opcode::Fadvise::new(
-        fd,
-        0,
-        libc::POSIX_MADV_SEQUENTIAL | libc::POSIX_FADV_NOREUSE,
-    )
-    .build();
+fn fadvice_file(ring: &mut IoUring, fd: types::Fd, advice_flag: i32) -> Result<(), ReadFileErr> {
+    let fadvice_e = opcode::Fadvise::new(fd, 0, advice_flag).build();
 
     if let Err(e) = unsafe { ring.submission().push(&fadvice_e) } {
         error!("Submission error: {e}");
@@ -460,11 +455,14 @@ fn write_response_and_close(
     pipe_r: &mut PipeReader,
     pipe_w: &mut PipeWriter,
 ) -> Result<(), ReadFileErr> {
-    // fadvice_file(ring, fd)?;
+    fadvice_file(ring, fd, libc::POSIX_MADV_SEQUENTIAL)?;
+    fadvice_file(ring, fd, libc::POSIX_FADV_NOREUSE)?;
     // send header keep buffer untill it has been confirmed it is sent
     let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
-    let _res = ring.submit_and_wait(2).expect("err");
+    let _res = ring.submit_and_wait(3).expect("err");
     // TODO: should be part of the first uring splice
+    let _cqe = ring.completion().next().unwrap();
+    let _cqe = ring.completion().next().unwrap();
     let _cqe = ring.completion().next().unwrap();
     add_splice_sqes(
         ring,
