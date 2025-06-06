@@ -1,674 +1,722 @@
+//! This is a simple server using rustls' unbuffered API. Meaning that the application layer must
+//! handle the buffers required to receive, process and send TLS data.
+
+use std::collections::HashMap;
+use std::env;
+use std::error::Error;
+use std::ffi::CStr;
+use std::io::{self};
+use std::mem::MaybeUninit;
+use std::net::TcpListener;
+use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::sync::Arc;
+
 use io_uring::squeue::Flags;
 use io_uring::{IoUring, opcode, types};
-use ktls::{CorkStream, config_ktls_server};
-use libc::{
-    AT_FDCWD, O_RDONLY, POSIX_MADV_SEQUENTIAL, SPLICE_F_MORE, SPLICE_F_MOVE, STATX_SIZE, statx,
-};
-use log::{error, info, warn};
-use rustls::ServerConfig;
+use libc::msghdr;
+use log::{info, warn};
+use rustls::kernel::KernelConnection;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
+use rustls::unbuffered::{
+    AppDataRecord, ConnectionState, EncodeError, InsufficientSizeError, UnbufferedStatus,
+};
+use rustls::{ExtractedSecrets, ServerConfig};
 use simple_logger::SimpleLogger;
-use std::ffi::{CStr, CString};
-use std::io::{PipeReader, PipeWriter, pipe};
-use std::mem::MaybeUninit;
-use std::os::unix::io::AsRawFd;
-use std::path::Path;
-use std::ptr::{NonNull, null_mut};
-use std::sync::{Arc, OnceLock};
-use std::{env, io, u64};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
 
-extern crate libc;
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut args = env::args();
+    args.next();
+    let cert_file = args.next().expect("missing certificate file argument");
+    let private_key_file = args.next().expect("missing private key file argument");
 
-#[derive(Debug)]
-enum SpliceError {
-    EAGAIN,
-    EBADF,
-    EINVAL,
-    ENOMEM,
-    ESPIPE,
-}
-
-impl From<i32> for SpliceError {
-    fn from(value: i32) -> Self {
-        match value {
-            libc::EAGAIN => SpliceError::EAGAIN,
-            libc::EBADF => SpliceError::EBADF,
-            libc::EINVAL => SpliceError::EINVAL,
-            libc::ENOMEM => SpliceError::ENOMEM,
-            libc::ESPIPE => SpliceError::ESPIPE,
-            _ => todo!(),
-        }
-    }
-}
-
-// static PIPE_DEFAULT_SIZE: OnceLock<u32> = OnceLock::new();
-
-// fn set_pipe_size(fd1: i32, fd2: i32) -> u32 {
-//     let size = unsafe { libc::fcntl(fd1, libc::F_GETPIPE_SZ) };
-//     let size2 = unsafe { libc::fcntl(fd2, libc::F_GETPIPE_SZ) };
-//     if size == -1 {
-//         panic!("COULD NOT GET SIZE OF PIPE!");
-//     }
-//     if size2 == -1 {
-//         panic!("COULD NOT GET SIZE OF PIPE!");
-//     }
-//     return (size.min(size2)).min(2_i32.pow(14)) as u32;
-// }
-
-const KTLS_SOCKET_SIZE: usize = 2_i32.pow(14) as usize;
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
     SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
+        .with_level(log::LevelFilter::Off)
         .init()
-        .unwrap();
-
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        error!("Usage: {} <address> <port>", args[0]);
-        std::process::exit(1);
-    }
-
-    let address = &args[1];
-    let port = &args[2];
-
-    let conf = tls_config();
-    let _ = tcp_listener(conf, address, port).await;
-}
-
-fn tls_config() -> ServerConfig {
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter("cert.pem")
-        .unwrap()
-        .map(|cert| cert.unwrap())
-        .collect();
-
-    let private_keys = PrivateKeyDer::from_pem_file("key.pem").unwrap();
+        .expect("Failed to initialize logger");
 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, private_keys)
-        .expect("could not create tls config");
-    config.enable_secret_extraction = true;
-    return config;
+        .with_single_cert(load_certs(cert_file)?, load_private_key(private_key_file)?)?;
+
+    if let Some(max_early_data_size) = MAX_EARLY_DATA_SIZE {
+        config.max_early_data_size = max_early_data_size;
+    }
+
+    config.max_fragment_size = MAX_FRAGMENT_SIZE;
+
+    let mut config = Arc::new(config);
+    Arc::get_mut(&mut config).unwrap().enable_secret_extraction = true;
+
+    setup_close_tls_msg();
+    let listener = TcpListener::bind(format!("[::]:{PORT}"))?;
+
+    // let mut ring = IoUring::new(IO_URING_SIZE)?;
+    let mut ring = IoUring::builder()
+        // .setup_single_issuer()
+        // .setup_iopoll()
+        .setup_sqpoll(2_000)
+        .build(IO_URING_SIZE)?;
+    let mut connection_map: HashMap<i32, ConnectionType> = HashMap::new();
+
+    accept_multi(listener.as_raw_fd(), &mut ring);
+
+    if let Err(_) = ring.submit() {
+        todo!();
+    };
+    handle(&config, &mut connection_map, &mut ring)?;
+
+    Ok(())
 }
 
-async fn tcp_listener(
-    config: ServerConfig,
-    address: &String,
-    port: &String,
-) -> std::io::Result<()> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    // let acceptor = Rc::new(acceptor);
+#[derive(Debug)]
+enum UserData {
+    NewConn,
+    SendZC(i32),
+    HandshakeRecv(i32),
+    Recv(i32),
+    SsoUlp(i32),
+    SsoTx(i32),
+    SsoRx(i32),
+    Send(i32),
+    SendMsg(i32),
+    Close(i32),
+}
 
-    let full_addr = format!("{}:{}", address, port);
-    info!("Listening on: https://{}", full_addr);
-    let listener = TcpListener::bind(full_addr.as_str()).await.unwrap();
+impl From<UserData> for u64 {
+    fn from(value: UserData) -> Self {
+        unsafe { std::mem::transmute(value) }
+    }
+}
 
+impl From<u64> for UserData {
+    fn from(value: u64) -> Self {
+        unsafe { std::mem::transmute(value) }
+    }
+}
+
+struct UnbufferedConn {
+    buffer: Vec<u8>,
+    out_buffer: Vec<u8>,
+    conn: UnbufferedServerConnection,
+}
+
+struct KTLSConn {
+    conn: KernelConnection<ServerConnectionData>,
+    rx: Box<MaybeUninit<ktls::CryptoInfo>>,
+    tx: Box<MaybeUninit<ktls::CryptoInfo>>,
+}
+
+impl KTLSConn {
+    fn new(kernel_conn: KernelConnection<ServerConnectionData>) -> Self {
+        Self {
+            conn: kernel_conn,
+            rx: Box::new_uninit(),
+            tx: Box::new_uninit(),
+        }
+    }
+
+    fn set_tx_rx(&mut self, secrets: ExtractedSecrets) -> Result<(), Box<dyn std::error::Error>> {
+        self.tx.write(ktls::CryptoInfo::from_rustls(
+            self.conn.negotiated_cipher_suite(),
+            secrets.tx,
+        )?);
+        self.rx.write(ktls::CryptoInfo::from_rustls(
+            self.conn.negotiated_cipher_suite(),
+            secrets.rx,
+        )?);
+        Ok(())
+    }
+}
+
+enum ConnectionType {
+    Handshake(UnbufferedConn),
+    Kernel(KTLSConn),
+}
+
+impl ConnectionType {
+    fn into_unbuf(&mut self) -> Result<&mut UnbufferedConn, &str> {
+        match self {
+            ConnectionType::Handshake(conn) => Ok(conn),
+            _ => Err("Not a unbuffered connection!"),
+        }
+    }
+
+    fn into_kernel(&mut self) -> Result<&mut KTLSConn, &str> {
+        match self {
+            ConnectionType::Kernel(conn) => Ok(conn),
+            _ => Err("Not a unbuffered connection!"),
+        }
+    }
+
+    fn unbuf_to_kernel(self) -> Result<(Self, ExtractedSecrets), Box<dyn std::error::Error>> {
+        let unbuf = match self {
+            ConnectionType::Handshake(unbuf) => unbuf,
+            _ => return Err("Did not contain unbuffered!".into()),
+        };
+        let (secrets, kernel_conn) = unbuf.conn.dangerous_into_kernel_connection()?;
+        let out = ConnectionType::Kernel(KTLSConn::new(kernel_conn));
+        Ok((out, secrets))
+    }
+}
+
+impl UnbufferedConn {
+    fn new(config: &Arc<ServerConfig>) -> Self {
+        let mut buffer = Vec::with_capacity(INCOMING_TLS_BUFSIZE);
+        buffer.resize(INCOMING_TLS_BUFSIZE, 0);
+        Self {
+            buffer: buffer,
+            out_buffer: Vec::new(),
+            conn: UnbufferedServerConnection::new(config.clone())
+                .expect("Error when creating new UnbufferedServerConnection!"),
+        }
+    }
+}
+
+fn handle(
+    config: &Arc<ServerConfig>,
+    connection_map: &mut HashMap<i32, ConnectionType>,
+    ring: &mut IoUring,
+) -> Result<(), Box<dyn Error>> {
+    let mut x = 0;
+    let mut y = 0;
     loop {
-        let (stream, addr) = listener.accept().await?;
-        let stream = CorkStream::new(stream);
-        let acceptor = acceptor.clone();
-
-        tokio::spawn(async move {
-            // Perform the TLS handshake asynchronously
-            match acceptor.accept(stream).await {
-                Ok(tls_stream) => {
-                    println!("Connection accepted from {:?}", addr);
-
-                    let ktls_stream = config_ktls_server(tls_stream).await.unwrap();
-
-                    let (drained, mut stream) = ktls_stream.into_raw();
-                    info!("drained: {:?}", drained);
-                    let drained = drained.unwrap_or_default();
-
-                    info!("{} bytes already decoded by rustls", drained.len());
-
-                    // let one: libc::c_int = 1;
-                    // unsafe {
-                    //     libc::setsockopt(
-                    //         ktls_stream.as_raw_fd(),
-                    //         libc::SOL_TCP,
-                    //         libc::TCP_CORK,
-                    //         &one as *const _ as *const _,
-                    //         std::mem::size_of_val(&one) as _,
-                    //     );
-                    // }
-                    handle_client(&mut stream, drained.clone())
-                        .await
-                        .expect("ERROR");
-
-                    info!("READING");
-                    // let mut dst: [u8; 1024] = [0; 1024];
-                    // let n_bytes = stream.read(&mut dst).await.expect("err");
-                    // info!("{:?}", String::from_utf8(dst.to_vec()));
-                    // info!("{}", n_bytes);
-                    info!("FINISHED SENDING FILE!");
-                    let x = stream.flush().await;
-                    info!("FINISHED flushing {:?}!", x);
-
-                    let x = stream.shutdown().await;
-
-                    info!("SHUTDOWN!, {:?}", x);
-                    drop(drained);
-                    // let one: libc::c_int = 0;
-                    // unsafe {
-                    //     libc::setsockopt(
-                    //         ktls_stream.as_raw_fd(),
-                    //         libc::SOL_TCP,
-                    //         libc::TCP_CORK,
-                    //         &one as *const _ as *const _,
-                    //         std::mem::size_of_val(&one) as _,
-                    //     );
-                    // }
-
-                    // Flush and shutdown TLS session properly
-                    // ktls_stream.flush().await.expect("Could not flush");
-                    // ktls_stream.shutdown().await.expect("Could not shutdown");
-                    // let mut retries = 3;
-                    // while retries > 0 {
-                    //     info!("FLUSHING!");
-                    //     match ktls_stream.flush().await {
-                    //         Ok(_) => break,
-                    //         Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    //             retries -= 1;
-                    //             use tokio::time::{Duration, sleep};
-                    //             sleep(Duration::from_millis(100)).await;
-                    //         }
-                    //         Err(e) => {
-                    //             eprintln!("Flush failed permanently: {}", e);
-                    //             break;
-                    //         }
-                    //     }
-                    // }
-                    // let mut retries = 3;
-                    // while retries > 0 {
-                    //     info!("SHUTDOWN!");
-                    //     match ktls_stream.shutdown().await {
-                    //         Ok(_) => break,
-                    //         Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    //             retries -= 1;
-                    //             use tokio::time::{Duration, sleep};
-                    //             sleep(Duration::from_millis(100)).await;
-                    //         }
-                    //         Err(e) => {
-                    //             eprintln!("shutdown failed permanently: {}", e);
-                    //             break;
-                    //         }
-                    //     }
-                    // }
+        let cqe = {
+            let next = ring.completion().next();
+            match next {
+                Some(cqe) => {
+                    x += 1;
+                    if let Err(_) = ring.submit() {
+                        todo!();
+                    };
+                    cqe
                 }
-                Err(e) => {
-                    error!("TLS handshake failed: {}", e);
+                None => {
+                    y += 1;
+                    if let Err(_) = ring.submit_and_wait(1) {
+                        todo!();
+                    };
+                    ring.completion().next().unwrap()
                 }
             }
-        });
-    }
-}
-
-#[derive(Debug)]
-enum ContentType {
-    Html,
-    Css,
-    Js,
-    Json,
-    Png,
-    Jpeg,
-    Txt,
-    OctetStream, // default
-}
-
-#[derive(Debug)]
-enum FileToServeErr {
-    NullByteInPath,
-}
-
-#[derive(Debug)]
-struct FileToServe {
-    content_type: ContentType,
-    path: CString,
-}
-
-impl FileToServe {
-    fn from_str(s: &str) -> Result<Self, FileToServeErr> {
-        // TODO: fix this string concat
-        let s = [".", s].concat();
-        let Ok(path) = CString::new(s.clone()) else {
-            return Err(FileToServeErr::NullByteInPath);
         };
-
-        // Get the file extension and determine content type
-        let extension = Path::new(&s)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        let content_type = match extension.as_str() {
-            "html" => ContentType::Html,
-            "css" => ContentType::Css,
-            "js" => ContentType::Js,
-            "json" => ContentType::Json,
-            "png" => ContentType::Png,
-            "jpg" | "jpeg" => ContentType::Jpeg,
-            "txt" => ContentType::Txt,
-            _ => ContentType::OctetStream,
-        };
-
-        Ok(FileToServe { content_type, path })
-    }
-
-    fn get_http_content_type(&self) -> &str {
-        match self.content_type {
-            ContentType::Html => "text/html",
-            ContentType::Css => "text/css",
-            ContentType::Js => "application/javascript",
-            ContentType::Json => "application/json",
-            ContentType::Png => "image/png",
-            ContentType::Jpeg => "image/jpeg",
-            ContentType::Txt => "text/plain",
-            ContentType::OctetStream => "application/octet-stream",
+        if (x + y) % 100 == 0 {
+            warn!("submitted without waiting: {x}, waited for: {y}");
         }
-    }
-}
 
-async fn handle_client(stream: &mut TcpStream, drained: Vec<u8>) -> io::Result<()> {
-    // let mut dst: [u8; 1024] = [0; 1024];
-    // let n_bytes = stream.read(&mut dst).await.expect("err");
-    // info!("{:?}", String::from_utf8(dst.to_vec()));
-    // info!("{}", n_bytes);
-    info!("http raw req: {:?}", String::from_utf8(drained.to_vec()));
+        info!("{:?}", cqe);
+        let user_data: UserData = cqe.user_data().into();
+        info!("{:?}", user_data);
+        match cqe.user_data().into() {
+            UserData::Recv(id) => {
+                let Some(ce) = connection_map.remove(&id) else {
+                    todo!()
+                };
 
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
-    // let _res = req.parse(&dst).expect("err").unwrap();
-    let _res = req.parse(&drained).expect("err").unwrap();
+                let (mut kernel_ce, secrets) = ce.unbuf_to_kernel()?;
 
-    // TODO: should be some fixed size and be able to handle large files.
-    let mut ring = IoUring::new(1024)?;
-    match req.path {
-        None => return Ok(()),
-        Some("/") => {
-            let (mut p_reader, mut p_writer) = pipe().expect("cound not create pipe");
+                ktls_setsocketopts(id, ring, (secrets, kernel_ce.into_kernel()?))?;
+                connection_map.insert(id, kernel_ce);
+                info!("KERNEL TLS ACTIVATED!");
+            }
+            UserData::NewConn => {
+                let id = cqe.result();
+                connection_map.insert(id, ConnectionType::Handshake(UnbufferedConn::new(&config)));
+                info!("STARTED NEW CONN ON {id}");
+                info!("CONNECTION MAP: {:?}", connection_map.keys());
+                // sleep(Duration::from_secs(1));
+                let ce = connection_map.get_mut(&id).unwrap().into_unbuf()?;
+                let UnbufferedStatus { discard: _, state } =
+                    ce.conn.process_tls_records(&mut ce.buffer[..0]);
 
-            set_nonblocking(p_reader.as_raw_fd())?;
-            set_nonblocking(p_writer.as_raw_fd())?;
+                info!("{:?}", state);
+                match state.unwrap() {
+                    ConnectionState::BlockedHandshake { .. } => {
+                        recv_tls_handshake(id, &mut ce.buffer, ring)?;
+                    }
+                    _ => todo!(),
+                }
+            }
+            UserData::HandshakeRecv(id) => {
+                let mut to_write = 0;
+                let mut res = cqe.result() as usize;
+                for i in 0..MAX_ITERATIONS {
+                    let ce = connection_map.get_mut(&id).unwrap().into_unbuf()?;
+                    info!("buffer: {:?}", ce.buffer[..res].iter().clone());
+                    info!("out buffer: {:?}", ce.out_buffer[..to_write].iter().clone());
+                    let UnbufferedStatus { mut discard, state } =
+                        ce.conn.process_tls_records(&mut ce.buffer[..res]);
 
-            let file = FileToServe::from_str("/index.html").expect("err");
-            http_read_file(file, &mut ring, stream, &mut p_reader, &mut p_writer).expect("err");
-            if let Err(e) = stream.flush().await {
-                error!("Failed to flush TLS stream: {}", e);
+                    info!("{:?}", state);
+                    info!("discard: {:?}", discard);
+                    info!("written: {:?}", to_write);
+                    match state.unwrap() {
+                        ConnectionState::EncodeTlsData(mut state) => {
+                            try_or_resize_and_retry(
+                                |out_buffer| state.encode(out_buffer),
+                                |e| {
+                                    if let EncodeError::InsufficientSize(is) = &e {
+                                        Ok(*is)
+                                    } else {
+                                        Err(e.into())
+                                    }
+                                },
+                                &mut ce.out_buffer,
+                                &mut to_write,
+                            )?;
+                        }
+                        ConnectionState::TransmitTlsData(s) => {
+                            send_tls_uring(id, &mut ce.out_buffer, to_write, ring)?;
+                            // TODO: should it be done before???
+                            s.done();
+                            info!("Written tls");
+                            break;
+                        }
+                        ConnectionState::ReadTraffic(mut state) => {
+                            while let Some(res) = state.next_record() {
+                                let AppDataRecord {
+                                    discard: new_discard,
+                                    payload,
+                                } = res?;
+                                discard += new_discard;
+
+                                if payload.starts_with(b"GET") {
+                                    let response = core::str::from_utf8(payload)?;
+                                    let header = response.lines().next().unwrap_or(response);
+
+                                    info!("{header}");
+                                } else {
+                                    info!("(.. continued HTTP request ..)");
+                                }
+                            }
+
+                            if !ce.conn.is_handshaking() {
+                                info!("HANDSHAKE IS DONE!");
+                                // todo!();
+                                let Some(ce) = connection_map.remove(&id) else {
+                                    todo!()
+                                };
+
+                                let (mut kernel_ce, secrets) = ce.unbuf_to_kernel()?;
+
+                                ktls_setsocketopts(id, ring, (secrets, kernel_ce.into_kernel()?))?;
+                                connection_map.insert(id, kernel_ce);
+                                break;
+                            } else {
+                                todo!()
+                            }
+                        }
+                        ConnectionState::WriteTraffic(_) => {
+                            //TODO: is this correct???
+                            if !ce.conn.is_handshaking() {
+                                info!("HANDSHAKE IS DONE DRAINING!");
+                                recv_tls(id, &mut ce.buffer, ring)?;
+                                break;
+                            } else {
+                                todo!();
+                            }
+                        }
+
+                        a => {
+                            // TODO: should not be catch all
+                            info!("not implemented {:?}, {:?}", a, cqe);
+                            todo!();
+                        }
+                    }
+
+                    // TODO: do we really need to fill the discarded with 0? or can we ignore?
+                    // This cannot be done rn
+                    if discard != 0 {
+                        ce.buffer.copy_within(discard..res, 0);
+                        res -= discard;
+
+                        warn!("discarded {discard}B from `incoming_tls`");
+                    }
+                    info!("\nnext {i}");
+                }
+            }
+            UserData::SendZC(id) => {
+                if io_uring::cqueue::more(cqe.flags()) {
+                    info!("sendzc: cqe with more to come: {:?}", cqe);
+                    if cqe.result() < 0 {
+                        panic!(
+                            "sendzc failed with: {}",
+                            io::Error::from_raw_os_error(-cqe.result())
+                        )
+                    }
+                } else {
+                    info!("sendzc: {:?}", cqe);
+
+                    let ce = connection_map.get_mut(&id).unwrap().into_unbuf()?;
+                    info!("buffer sendzc: {:?}", ce.buffer[..85].iter().clone());
+                    let UnbufferedStatus { discard: _, state } =
+                        ce.conn.process_tls_records(&mut ce.buffer[..0]);
+
+                    info!("{:?}", state);
+                    match state.unwrap() {
+                        ConnectionState::BlockedHandshake { .. } => {
+                            recv_tls_handshake(id, &mut ce.buffer, ring)?;
+                        }
+                        ConnectionState::WriteTraffic(_) => {
+                            if !ce.conn.is_handshaking() {
+                                info!("HANDSHAKE IS DONE DRAINING!");
+                                recv_tls(id, &mut ce.buffer, ring)?;
+                            } else {
+                                todo!();
+                            }
+                        }
+                        a => {
+                            info!("not implemented {:?}", a);
+                            todo!()
+                        }
+                    }
+                }
+            }
+            UserData::SsoUlp(_id) => {
+                if cqe.result() < 0 {
+                    // TODO: should retry
+
+                    panic!(
+                        "set socket opts failed with: {}",
+                        io::Error::from_raw_os_error(-cqe.result())
+                    )
+                }
+            }
+            UserData::SsoTx(_id) => {
+                if cqe.result() < 0 {
+                    // TODO: should retry
+
+                    panic!(
+                        "set socket opts failed with: {}",
+                        io::Error::from_raw_os_error(-cqe.result())
+                    )
+                }
+            }
+
+            UserData::SsoRx(id) => {
+                if cqe.result() < 0 {
+                    // TODO: should retry
+
+                    panic!(
+                        "set socket opts failed with: {}",
+                        io::Error::from_raw_os_error(-cqe.result())
+                    )
+                }
+
+                static RESPONSE: &CStr =
+                    c"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nHello world from kTLS server\r\n";
+                let send_e = opcode::Send::new(
+                    types::Fd(id),
+                    RESPONSE.as_ptr().cast(),
+                    RESPONSE.count_bytes() as u32,
+                )
+                .build()
+                .user_data(UserData::Send(id).into());
+
+                if let Err(_e) = unsafe { ring.submission().push(&send_e) } {
+                    todo!();
+                }
+            }
+            UserData::Send(id) => {
+                if cqe.result() < 0 {
+                    // TODO: should retry
+                    panic!(
+                        "Send failed with: {}",
+                        io::Error::from_raw_os_error(-cqe.result())
+                    )
+                }
+
+                // TODO: should shutdown before closing???
+                send_close_notify(id, ring)?;
+            }
+            UserData::SendMsg(_id) => {
+                if cqe.result() < 0 {
+                    // TODO: should retry
+                    panic!(
+                        "Send failed with: {}",
+                        io::Error::from_raw_os_error(-cqe.result())
+                    )
+                }
+            }
+            UserData::Close(id) => {
+                if cqe.result() < 0 {
+                    // TODO: should retry
+                    panic!(
+                        "Send failed with: {}",
+                        io::Error::from_raw_os_error(-cqe.result())
+                    )
+                } else {
+                    info!("CLOSED: {id}");
+
+                    // sleep(Duration::from_secs(1));
+                    connection_map.remove(&id);
+                }
+            }
+            a => {
+                info!("not implemented {:?}", a);
+                info!("not implemented {:?}", -cqe.result());
+                info!("{}", io::Error::from_raw_os_error(-cqe.result()));
+                todo!()
             }
         }
-        Some(p) => {
-            info!("path is: {p}");
-            let (mut p_reader, mut p_writer) = pipe().expect("cound not create pipe");
-            let file = FileToServe::from_str(p).expect("err");
-            info!("{:?}", file);
-            http_read_file(file, &mut ring, stream, &mut p_reader, &mut p_writer).expect("err");
-            if let Err(e) = stream.flush().await {
-                error!("Failed to flush TLS stream: {}", e);
-            }
-        }
-    }
 
-    Ok(())
+        info!("\nnext");
+    }
 }
 
-fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+// TODO: change this:
+use rustls::{
+    AlertDescription,
+    internal::msgs::{enums::AlertLevel, message::Message},
+};
+const TLS_SET_RECORD_TYPE: libc::c_int = 1;
+const ALERT: u8 = 0x15;
+
+// TODO: change this:
+// Yes, really. cmsg components are aligned to [libc::c_long]
+#[cfg_attr(target_pointer_width = "32", repr(C, align(4)))]
+#[cfg_attr(target_pointer_width = "64", repr(C, align(8)))]
+struct Cmsg<const N: usize> {
+    hdr: libc::cmsghdr,
+    data: [u8; N],
+}
+
+impl<const N: usize> Cmsg<N> {
+    fn new(level: i32, typ: i32, data: [u8; N]) -> Self {
+        Self {
+            hdr: libc::cmsghdr {
+                // on Linux this is a usize, on macOS this is a u32
+                #[allow(clippy::unnecessary_cast)]
+                cmsg_len: (memoffset::offset_of!(Self, data) + N) as _,
+                cmsg_level: level,
+                cmsg_type: typ,
+            },
+            data,
+        }
+    }
+}
+
+// TODO: change this:
+static mut CLOSE_NOTIFY_MSGHDR_PTR: *const msghdr = std::ptr::null();
+fn get_close_notify_msg_ptr() -> *const msghdr {
+    unsafe { CLOSE_NOTIFY_MSGHDR_PTR }
+}
+
+fn setup_close_tls_msg() {
+    let mut data = vec![];
+    Message::build_alert(AlertLevel::Warning, AlertDescription::CloseNotify)
+        .payload
+        .encode(&mut data);
+    let data = data.leak();
+
+    let cmsg = Cmsg::new(libc::SOL_TLS, TLS_SET_RECORD_TYPE, [ALERT]);
+    let cmsg = Box::leak(Box::new(cmsg));
+
+    let msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut libc::iovec {
+            iov_base: data.as_mut_ptr() as _,
+            iov_len: data.len(),
+        },
+        msg_iovlen: 1,
+        msg_control: cmsg as *mut _ as *mut _,
+        msg_controllen: cmsg.hdr.cmsg_len,
+        msg_flags: 0,
+    };
+
+    let msg = Box::leak(Box::new(msg));
     unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        println!("FLAGS: {}", flags);
-        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        CLOSE_NOTIFY_MSGHDR_PTR = msg;
     }
-    Ok(())
 }
-
-fn http_read_file(
-    file: FileToServe,
-    ring: &mut IoUring,
-    stream: &mut TcpStream,
-    pipe_r: &mut PipeReader,
-    pipe_w: &mut PipeWriter,
-) -> Result<(), ReadFileErr> {
-    if let Err(e) = open_file(ring, &file.path) {
-        error!("FAILED TO OPEN FILE!");
-        return Err(e);
-    };
-
-    let mut statx: MaybeUninit<statx> = MaybeUninit::uninit();
-    let statx_ptr: NonNull<statx> = unsafe { NonNull::new_unchecked(statx.as_mut_ptr()) };
-    if let Err(e) = statx_file(ring, &file.path, statx_ptr) {
-        error!("FAILED TO STATX FILE!");
-        return Err(e);
-    };
-
-    let Ok((fd, file_size)) = get_fd_and_size(ring, statx_ptr) else {
-        error!("FAILED TO WRITE FILE!");
-        panic!();
-    };
-    info!("fd: {:?}, file_size: {}", fd, file_size);
-
-    write_response_and_close(ring, stream, fd, file_size, &file, pipe_r, pipe_w)
-}
-
-fn open_file(ring: &mut IoUring, path: &CStr) -> Result<(), ReadFileErr> {
-    let openat_e = opcode::OpenAt::new(types::Fd(AT_FDCWD), path.as_ptr())
-        .flags(O_RDONLY)
+pub fn send_close_notify(fd: std::os::fd::RawFd, ring: &mut IoUring) -> std::io::Result<()> {
+    let send_msg_e = opcode::SendMsg::new(types::Fd(fd), get_close_notify_msg_ptr())
+        .flags(0)
         .build()
-        .flags(Flags::IO_LINK);
+        .flags(Flags::IO_LINK)
+        .user_data(UserData::SendMsg(fd).into());
 
-    // TODO: might already be opened by another thread?
-    if let Err(e) = unsafe { ring.submission().push(&openat_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
+    let close_e = opcode::Close::new(types::Fd(fd))
+        .build()
+        .user_data(UserData::Close(fd).into());
+
+    if let Err(_e) = unsafe { ring.submission().push_multiple(&[send_msg_e, close_e]) } {
+        todo!();
     }
     Ok(())
 }
 
-fn statx_file(
+fn try_or_resize_and_retry<E>(
+    mut f: impl FnMut(&mut [u8]) -> Result<usize, E>,
+    map_err: impl FnOnce(E) -> Result<InsufficientSizeError, Box<dyn Error>>,
+    outgoing_tls: &mut Vec<u8>,
+    outgoing_used: &mut usize,
+) -> Result<usize, Box<dyn Error>>
+where
+    E: Error + 'static,
+{
+    let written = match f(&mut outgoing_tls[*outgoing_used..]) {
+        Ok(written) => written,
+
+        Err(e) => {
+            let InsufficientSizeError { required_size } = map_err(e)?;
+            let new_len = *outgoing_used + required_size;
+            outgoing_tls.resize(new_len, 0);
+            warn!("resized `outgoing_tls` buffer to {new_len}B");
+
+            f(&mut outgoing_tls[*outgoing_used..])?
+        }
+    };
+
+    *outgoing_used += written;
+
+    Ok(written)
+}
+
+fn ktls_setsocketopts(
+    sock: i32,
     ring: &mut IoUring,
-    path: &CStr,
-    statx_ptr: NonNull<statx>,
-) -> Result<(), ReadFileErr> {
-    let statx_e = opcode::Statx::new(
-        types::Fd(AT_FDCWD),
-        path.as_ptr(),
-        statx_ptr.as_ptr().cast(),
+    (secrets, kernel_conn): (rustls::ExtractedSecrets, &mut KTLSConn),
+) -> Result<(), Box<dyn std::error::Error>> {
+    static ULP_NAME: &std::ffi::CStr = c"tls";
+    let setsockopt_ulp_e = opcode::SetSockOpt::new(
+        types::Fd(sock),
+        libc::SOL_TCP as u32,
+        libc::TCP_ULP as u32,
+        ULP_NAME.as_ptr() as *const std::ffi::c_void,
+        ULP_NAME.to_bytes().len() as libc::socklen_t,
     )
-    .mask(STATX_SIZE)
-    .build();
+    .build()
+    .flags(Flags::IO_LINK)
+    .user_data(UserData::SsoUlp(sock).into());
 
-    if let Err(e) = unsafe { ring.submission().push(&statx_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
+    kernel_conn.set_tx_rx(secrets)?;
+
+    let tx_ptr = unsafe { kernel_conn.tx.as_mut().assume_init_mut() };
+    let setsockopt_tx_e = opcode::SetSockOpt::new(
+        types::Fd(sock),
+        libc::SOL_TLS as u32,
+        libc::TLS_TX as u32,
+        tx_ptr.as_ptr(),
+        tx_ptr.size() as _,
+    )
+    .build()
+    .flags(Flags::IO_LINK)
+    .user_data(UserData::SsoTx(sock).into());
+
+    let rx_ptr = unsafe { kernel_conn.rx.as_mut().assume_init_mut() };
+    let setsockopt_rx_e = opcode::SetSockOpt::new(
+        types::Fd(sock),
+        libc::SOL_TLS as u32,
+        libc::TLS_RX as u32,
+        rx_ptr.as_ptr(),
+        rx_ptr.size() as _,
+    )
+    .build()
+    // Don't link after last
+    .user_data(UserData::SsoRx(sock).into());
+
+    if let Err(_e) = unsafe {
+        ring.submission()
+            .push_multiple(&[setsockopt_ulp_e, setsockopt_tx_e, setsockopt_rx_e])
+    } {
+        todo!();
     }
     Ok(())
 }
 
-fn fadvice_file(ring: &mut IoUring, fd: types::Fd, advice_flag: i32) -> Result<(), ReadFileErr> {
-    let fadvice_e = opcode::Fadvise::new(fd, 0, advice_flag).build();
+fn recv_tls(
+    sock: i32,
+    incoming_tls: &mut Vec<u8>,
+    ring: &mut IoUring,
+) -> Result<(), Box<dyn Error>> {
+    let recv_e = opcode::Recv::new(
+        types::Fd(sock.as_raw_fd()),
+        incoming_tls.as_mut_ptr(),
+        incoming_tls.capacity() as u32,
+    )
+    .build()
+    .user_data(UserData::Recv(sock.as_raw_fd()).into());
 
-    if let Err(e) = unsafe { ring.submission().push(&fadvice_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
+    if let Err(_e) = unsafe { ring.submission().push(&recv_e) } {
+        todo!();
     }
+    // TODO: integrate io uring multishot somehow
     Ok(())
 }
 
-#[derive(Debug)]
-enum ReadFileErr {
-    FailedPush,
-    OpenAt,
-    Statx,
-    // NoSubmission,
-    Submission,
-}
-
-type StatxSize = u64;
-
-fn get_fd_and_size(
+fn recv_tls_handshake(
+    sock: i32,
+    incoming_tls: &mut Vec<u8>,
     ring: &mut IoUring,
-    statx_ptr: NonNull<statx>,
-) -> Result<(types::Fd, StatxSize), ReadFileErr> {
-    if let Err(_) = ring.submit_and_wait(2) {
-        return Err(ReadFileErr::Submission);
-    };
+) -> Result<(), Box<dyn Error>> {
+    let recv_e = opcode::Recv::new(
+        types::Fd(sock.as_raw_fd()),
+        incoming_tls.as_mut_ptr(),
+        incoming_tls.capacity() as u32,
+    )
+    .build()
+    .user_data(UserData::HandshakeRecv(sock.as_raw_fd()).into());
 
-    let Some(openat_cqe) = ring.completion().next() else {
-        panic!();
-    };
-
-    let fd = match openat_cqe.result() {
-        // TODO: should it advance the submission queue as well???
-        err if err < 0 => return Err(ReadFileErr::OpenAt),
-        fd => types::Fd(fd),
-    };
-
-    let Some(statx_cqe) = ring.completion().next() else {
-        panic!();
-    };
-
-    if let -1 = statx_cqe.result() {
-        return Err(ReadFileErr::Statx);
-    };
-
-    let file_size = unsafe { statx_ptr.as_ref().stx_size };
-
-    Ok((fd, file_size))
-}
-
-fn write_response_and_close(
-    ring: &mut IoUring,
-    stream: &mut TcpStream,
-    fd: types::Fd,
-    file_size: StatxSize,
-    file: &FileToServe,
-    pipe_r: &mut PipeReader,
-    pipe_w: &mut PipeWriter,
-) -> Result<(), ReadFileErr> {
-    fadvice_file(ring, fd, libc::POSIX_MADV_SEQUENTIAL)?;
-    fadvice_file(ring, fd, libc::POSIX_FADV_NOREUSE)?;
-    // send header keep buffer untill it has been confirmed it is sent
-    let header_buffer = send_header(ring, types::Fd(stream.as_raw_fd()), file, file_size)?;
-    let _res = ring.submit_and_wait(3).expect("err");
-    // TODO: should be part of the first uring splice
-    let _cqe = ring.completion().next().unwrap();
-    let _cqe = ring.completion().next().unwrap();
-    let _cqe = ring.completion().next().unwrap();
-    add_splice_sqes(
-        ring,
-        fd,
-        pipe_w,
-        types::Fd(stream.as_raw_fd()),
-        pipe_r,
-        file_size as usize,
-    )?;
-    // TODO: can close while other use it?
-    close_file(ring, fd)?;
-    let _res = ring.submit_and_wait(1).expect("err");
-    drop(header_buffer);
+    if let Err(_e) = unsafe { ring.submission().push(&recv_e) } {
+        todo!();
+    }
+    // TODO: integrate io uring multishot somehow
     Ok(())
 }
 
-fn add_splice_sqes(
+fn send_tls_uring(
+    sock: i32,
+    outgoing_tls: &[u8],
+    len: usize,
     ring: &mut IoUring,
-    fd_read: types::Fd,
-    pipe_w: &mut PipeWriter,
-    socket_fd: types::Fd,
-    pipe_r: &mut PipeReader,
-    file_size: usize,
-) -> Result<usize, ReadFileErr> {
-    let chunk_size = KTLS_SOCKET_SIZE;
-    let mut num_sqe = 0;
-    let flags = libc::SPLICE_F_MOVE;
+) -> Result<(), Box<dyn Error>> {
+    let send_zc_e = opcode::SendZc::new(
+        types::Fd(sock.as_raw_fd()),
+        outgoing_tls.as_ptr(),
+        len as u32,
+    )
+    .build()
+    .user_data(UserData::SendZC(sock).into());
 
-    let mut spliced_in = 0;
-    let mut spliced_out = 0;
-
-    while spliced_out < file_size {
-        num_sqe = 0;
-        // drain pipe
-        if spliced_out < spliced_in {
-            spliced_pipe_to_socket(
-                ring,
-                socket_fd,
-                pipe_r,
-                (spliced_in - spliced_out) as u32,
-                1,
-                flags,
-            )?;
-            num_sqe += 1;
-        }
-
-        for offset in (spliced_in..file_size).step_by(chunk_size as usize) {
-            let remaining = file_size.saturating_sub(offset);
-            let len = remaining.min(chunk_size as usize) as u32;
-            // submit enough requests to send the whole file.
-            // WARNING: This can overflow the io_uring submission queue.
-            // let mut flags = SPLICE_F_MOVE | SPLICE_F_MORE;
-            // if remaining == 0 {
-            //     flags = SPLICE_F_MOVE;
-            // }
-
-            spliced_file_to_pipe(ring, fd_read, pipe_w, len, 0, flags)?;
-            num_sqe += 1;
-            spliced_pipe_to_socket(ring, socket_fd, pipe_r, chunk_size as u32, 1, flags)?;
-            num_sqe += 1;
-        }
-        poll_add(ring, socket_fd)?;
-
-        info!("Submitting and waiting for: {num_sqe}");
-        let res = ring.submit_and_wait(num_sqe).expect("err");
-        for i in 0..num_sqe {
-            let cqe = ring.completion().next().unwrap();
-            info!("{:?}", cqe);
-            let n = cqe.result();
-            if n < 0 {
-                if n == -125 {
-                    warn!("CANCELLED");
-                    continue;
-                }
-                let e: SpliceError = (-n).into();
-                error!("{:?}", e);
-                continue;
-            }
-
-            if cqe.user_data() == 0 {
-                spliced_in += n as usize;
-            } else if cqe.user_data() == 1 {
-                spliced_out += n as usize;
-            } else {
-                todo!();
-            }
-        }
-
-        if spliced_out == file_size {}
-        // waiting on poll
-        if spliced_out < file_size {
-            let res = ring.submit_and_wait(1).expect("err");
-            let cqe = ring.completion().next().unwrap();
-            info!("{:?}", cqe);
-        }
-        info!("spliced in: {spliced_in}");
-        info!("spliced out: {spliced_out}");
+    if let Err(_e) = unsafe { ring.submission().push(&send_zc_e) } {
+        todo!();
     }
-    info!("written to socket");
 
-    Ok(num_sqe)
+    Ok(())
 }
 
-fn spliced_file_to_pipe(
-    ring: &mut IoUring,
-    fd_read: types::Fd,
-    pipe_w: &mut PipeWriter,
-    len: u32,
-    read_id: u64,
-    flags: u32,
-) -> Result<(), ReadFileErr> {
-    let splice_read_e = opcode::Splice::new(fd_read, -1, types::Fd(pipe_w.as_raw_fd()), -1, len)
-        .flags(flags)
+fn accept_multi(sock: i32, ring: &mut IoUring) {
+    let acc_multi_e = opcode::AcceptMulti::new(types::Fd(sock))
         .build()
-        .user_data(read_id)
-        .flags(Flags::IO_LINK);
-    info!("read req: {:?}", splice_read_e);
+        .user_data(UserData::NewConn.into());
 
-    if let Err(e) = unsafe { ring.submission().push(&splice_read_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
+    if let Err(_e) = unsafe { ring.submission().push(&acc_multi_e) } {
+        todo!();
     }
-
-    return Ok(());
 }
 
-fn spliced_pipe_to_socket(
-    ring: &mut IoUring,
-    fd_write: types::Fd,
-    pipe_r: &mut PipeReader,
-    len: u32,
-    write_id: u64,
-    flags: u32,
-) -> Result<(), ReadFileErr> {
-    let splice_write_e = opcode::Splice::new(types::Fd(pipe_r.as_raw_fd()), -1, fd_write, -1, len)
-        .flags(flags)
-        .build()
-        .user_data(write_id)
-        .flags(Flags::IO_LINK);
-
-    info!("write req: {:?}", splice_write_e);
-
-    if let Err(e) = unsafe { ring.submission().push(&splice_write_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
-    }
-    return Ok(());
+fn load_certs(path: impl AsRef<Path>) -> Result<Vec<CertificateDer<'static>>, io::Error> {
+    Ok(CertificateDer::pem_file_iter(path)
+        .expect("cannot open certificate file")
+        .map(|cert| cert.unwrap())
+        .collect())
 }
 
-fn poll_add(ring: &mut IoUring, fd: types::Fd) -> Result<(), ReadFileErr> {
-    let poll_add_e = opcode::PollAdd::new(fd, libc::POLLOUT as u32)
-        .build()
-        .user_data(3)
-        .flags(Flags::IO_DRAIN);
-
-    info!("poll req: {:?}", poll_add_e);
-
-    if let Err(e) = unsafe { ring.submission().push(&poll_add_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
-    }
-    return Ok(());
+fn load_private_key(path: impl AsRef<Path>) -> Result<PrivateKeyDer<'static>, io::Error> {
+    Ok(PrivateKeyDer::from_pem_file(path).expect("cannot open private key file"))
 }
 
-fn close_file(ring: &mut IoUring, fd: types::Fd) -> Result<(), ReadFileErr> {
-    let close_e = opcode::Close::new(fd).build().user_data(u64::MAX - 1);
+const KB: usize = 1024;
+const INCOMING_TLS_BUFSIZE: usize = 16 * KB;
+// const OUTGOING_TLS_INITIAL_BUFSIZE: usize = 0;
+const MAX_EARLY_DATA_SIZE: Option<u32> = Some(128);
+const MAX_FRAGMENT_SIZE: Option<usize> = None;
 
-    if let Err(e) = unsafe { ring.submission().push(&close_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
-    }
-    return Ok(());
-}
+const PORT: u16 = 1443;
+const MAX_ITERATIONS: usize = 30;
 
-fn send_header(
-    ring: &mut IoUring,
-    fd: types::Fd,
-    file: &FileToServe,
-    length: StatxSize,
-) -> Result<String, ReadFileErr> {
-    // TODO: maybe switch to http2 for concurrent requests
-    let path = &file.path;
-    let response_buffer = format!(
-        "HTTP/1.1 200 OK\r\n\
-Content-Type: {content_type}\r\n\
-Content-Length: {length}\r\n\
-Content-Disposition: inline; filename=\"{filename}\"\r\n\
-Cache-Control: no-cache\r\n\
-Server: FastFileServer/1.0\r\n\
-\r\n",
-        content_type = file.get_http_content_type(),
-        length = length,
-        filename = path.to_str().unwrap(),
-    );
-
-    info!("{}", response_buffer);
-
-    let send_e = opcode::Send::new(fd, response_buffer.as_ptr(), response_buffer.len() as u32)
-        .build()
-        .user_data(u64::MAX)
-        .flags(Flags::IO_LINK);
-
-    if let Err(e) = unsafe { ring.submission().push(&send_e) } {
-        error!("Submission error: {e}");
-        return Err(ReadFileErr::FailedPush);
-    }
-    // WARNING: don't drop the buffer before completion of the send
-    return Ok(response_buffer);
-}
+const IO_URING_SIZE: u32 = 1024 * 16;

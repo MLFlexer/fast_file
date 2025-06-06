@@ -19,9 +19,9 @@
       in {
         devShells.default = with pkgs;
           mkShell {
-            buildInputs = with pkgs; [ openssl rust_nightly bacon ];
+            buildInputs = with pkgs; [ btop hey openssl rust_nightly bacon ];
 
-            env = { };
+            env = { SSL_CERT_FILE = "./cert.pem"; };
           };
       });
 }
