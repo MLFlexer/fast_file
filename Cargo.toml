@@ -9,6 +9,7 @@ io-uring = "0.7.7"
 ktls = "6.0.2"
 libc = "0.2.172"
 log = "0.4.27"
+memoffset = "0.9.1"
 rustls = "0.23.27"
 simple_logger = "5.0.0"
 tokio = { version = "1.45.1", features = ["net", "rt", "time"] }
