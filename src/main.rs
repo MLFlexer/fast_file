@@ -10,8 +10,9 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use simple_logger::SimpleLogger;
 use std::ffi::{CStr, CString};
-use std::io::{PipeReader, PipeWriter, pipe};
+use std::io::{PipeReader, PipeWriter, Read, pipe};
 use std::mem::MaybeUninit;
+use std::os::fd::FromRawFd;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::{NonNull, null_mut};
@@ -60,17 +61,39 @@ impl From<i32> for SpliceError {
 
 const KTLS_SOCKET_SIZE: usize = 2_i32.pow(14) as usize;
 
+fn init_logger(log_level: &String) {
+    let mut log_level = log_level.to_uppercase();
+    if log_level.is_empty() {
+        log_level = "OFF".to_string();
+    }
+
+    if log_level != "OFF" {
+        let level = match log_level.as_str() {
+            "ERROR" => log::LevelFilter::Error,
+            "WARN" | "WARNING" => log::LevelFilter::Warn,
+            "INFO" => log::LevelFilter::Info,
+            "DEBUG" => log::LevelFilter::Debug,
+            "TRACE" => log::LevelFilter::Trace,
+            _ => log::LevelFilter::Info, // default to INFO if unrecognized
+        };
+
+        SimpleLogger::new()
+            .with_level(level)
+            .init()
+            .expect("Failed to initialize logger");
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .init()
-        .unwrap();
-
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        error!("Usage: {} <address> <port>", args[0]);
+    if args.len() < 3 {
+        eprintln!("Usage: {} <address> <port> <log_level>", args[0]);
         std::process::exit(1);
+    }
+
+    if args.len() > 3 {
+        init_logger(&args[3]);
     }
 
     let address = &args[1];
@@ -125,7 +148,7 @@ async fn tcp_listener(
                     info!("drained: {:?}", drained);
                     let drained = drained.unwrap_or_default();
 
-                    info!("{} bytes already decoded by rustls", drained.len());
+                    println!("{} bytes already decoded by rustls", drained.len());
 
                     // let one: libc::c_int = 1;
                     // unsafe {
@@ -137,9 +160,7 @@ async fn tcp_listener(
                     //         std::mem::size_of_val(&one) as _,
                     //     );
                     // }
-                    handle_client(&mut stream, drained.clone())
-                        .await
-                        .expect("ERROR");
+                    handle_client(&mut stream, drained).await.expect("ERROR");
 
                     info!("READING");
                     // let mut dst: [u8; 1024] = [0; 1024];
@@ -153,7 +174,6 @@ async fn tcp_listener(
                     let x = stream.shutdown().await;
 
                     info!("SHUTDOWN!, {:?}", x);
-                    drop(drained);
                     // let one: libc::c_int = 0;
                     // unsafe {
                     //     libc::setsockopt(
@@ -275,23 +295,37 @@ impl FileToServe {
     }
 }
 
-async fn handle_client(stream: &mut TcpStream, drained: Vec<u8>) -> io::Result<()> {
-    // let mut dst: [u8; 1024] = [0; 1024];
-    // let n_bytes = stream.read(&mut dst).await.expect("err");
-    // info!("{:?}", String::from_utf8(dst.to_vec()));
-    // info!("{}", n_bytes);
-    info!("http raw req: {:?}", String::from_utf8(drained.to_vec()));
-
+fn read_http_request(buf: &Vec<u8>) -> Option<String> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
-    // let _res = req.parse(&dst).expect("err").unwrap();
-    let _res = req.parse(&drained).expect("err").unwrap();
 
+    info!(
+        "http raw req: {:?}",
+        str::from_utf8(&buf).unwrap_or("<invalid utf8>")
+    );
+
+    match req.parse(&buf) {
+        Ok(httparse::Status::Complete(_)) => {
+            return Some(req.path.unwrap_or("<no path>").to_string());
+        }
+        _ => return None,
+    }
+}
+
+async fn handle_client(stream: &mut TcpStream, drained: Vec<u8>) -> io::Result<()> {
+    // TODO: should be handled better
+    let mut drained = drained;
+    let mut path = read_http_request(&drained);
+    while path.is_none() {
+        let mut sync_stream = unsafe { std::net::TcpStream::from_raw_fd(stream.as_raw_fd()) };
+        sync_stream.read_to_end(&mut drained);
+        path = read_http_request(&drained);
+        std::mem::forget(sync_stream);
+    }
     // TODO: should be some fixed size and be able to handle large files.
     let mut ring = IoUring::new(1024)?;
-    match req.path {
-        None => return Ok(()),
-        Some("/") => {
+    match path.unwrap().as_str() {
+        "/" => {
             let (mut p_reader, mut p_writer) = pipe().expect("cound not create pipe");
 
             set_nonblocking(p_reader.as_raw_fd())?;
@@ -303,7 +337,7 @@ async fn handle_client(stream: &mut TcpStream, drained: Vec<u8>) -> io::Result<(
                 error!("Failed to flush TLS stream: {}", e);
             }
         }
-        Some(p) => {
+        p => {
             info!("path is: {p}");
             let (mut p_reader, mut p_writer) = pipe().expect("cound not create pipe");
             let file = FileToServe::from_str(p).expect("err");
