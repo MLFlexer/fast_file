@@ -1,10 +1,12 @@
 # Fast File
 
 ## ILO
-1. Async Rust
+1. Async Rust?
 2. io_uring
 3. sockets
 4. TCP
+5. TLS
+6. HTTP
 
 ## Idea
 A minimal file server targeting Raspberry Pi 5.
@@ -50,6 +52,7 @@ This way there is no copying to userspace.
 
 # Rustls tls handshake
 https://github.com/rustls/rustls/blob/19133f2f0baf13fea8ec4e646d29cfe84da7fd44/examples/src/bin/unbuffered-server.rs
+```
 hey -n 1000 -cpus 10 -c 1000 -host localhost https://127.0.0.0:1443
 
 Summary:
@@ -92,8 +95,10 @@ Details (average, fastest, slowest):
 
 Status code distribution:
   [200] 1000 responses
+```
 
 # IO_URING HANDSHAKE:
+```
 hey -n 1000 -cpus 10 -c 1000 -host localhost https://127.0.0.0:1443
 
 Summary:
@@ -136,3 +141,4 @@ Details (average, fastest, slowest):
 
 Status code distribution:
   [200] 1000 responses
+```
